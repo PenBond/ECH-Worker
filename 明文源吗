@@ -2350,9 +2350,17 @@ if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
                             if (proxyConfig && proxyConfig.type === 'socks5') {
                                 remoteSocket = await establishSocksConnection(addressType, hostname, port);
                             } else if (proxyConfig && proxyConfig.type === 'direct') {
-                                remoteSocket = connect({ hostname: proxyConfig.host, port: proxyConfig.port });
+                                remoteSocket = connect({ 
+                                    hostname: proxyConfig.host, 
+                                    port: proxyConfig.port,
+                                    secureTransport: proxyConfig.port == 443 ? "on" : "off"
+                                });
                             } else {
-                                remoteSocket = connect({ hostname: hostname, port: port });
+                                remoteSocket = connect({ 
+                                    hostname: hostname, 
+                                    port: port,
+                                    secureTransport: port == 443 ? "on" : "off"
+                                });
                             }
                             
                             const writer = remoteSocket.writable.getWriter();
@@ -2442,9 +2450,17 @@ if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
                     if (proxyConfig && proxyConfig.type === 'socks5') {
                         remoteSocket = await establishSocksConnection(addressType, hostname, port);
                     } else if (proxyConfig && proxyConfig.type === 'direct') {
-                        remoteSocket = connect({ hostname: proxyConfig.host, port: proxyConfig.port });
+                        remoteSocket = connect({ 
+                            hostname: proxyConfig.host, 
+                            port: proxyConfig.port,
+                            secureTransport: proxyConfig.port == 443 ? "on" : "off"
+                        });
                     } else {
-                        remoteSocket = connect({ hostname: hostname, port: port });
+                        remoteSocket = connect({ 
+                            hostname: hostname, 
+                            port: port,
+                            secureTransport: port == 443 ? "on" : "off"
+                        });
                     }
                     
                     // Send initial data
@@ -2484,7 +2500,11 @@ if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
         async function connectAndSend(address, port, useSocks = false) {
             const remoteSock = useSocks ?
                 await establishSocksConnection(addrType, address, port) :
-                connect({ hostname: address, port: port });
+                connect({ 
+                    hostname: address, 
+                    port: port,
+                    secureTransport: port == 443 ? "on" : "off"
+                });
             const writer = remoteSock.writable.getWriter();
             await writer.write(rawData);
             writer.releaseLock();
