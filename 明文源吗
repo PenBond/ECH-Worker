@@ -1,4 +1,4 @@
-    // CFnew - 终端 v2.9.3
+// CFnew - 终端 v2.9.3
     // 版本: v2.9.3
     import { connect } from 'cloudflare:sockets';
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
@@ -19,6 +19,11 @@
     let ev = true;   
     let et = false; 
     let ex = false;  
+    let es = false;  // Enable Shadowsocks (configurable via KV/API)
+    let ssMethod = 'none';  // From SS code
+    let ssPassword = at;  // Use same UUID as VLESS/Trojan
+    let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
+    
     let tp = '';
     // 启用ECH功能（true启用，false禁用）
     let enableECH = false;  
@@ -305,6 +310,246 @@
         
         return { address: input, port: null };
     }
+    
+    // From SS: safeBase64Encode (not in existing code)
+function safeBase64Encode(str) {
+  try {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(str);
+    let binary = '';
+    for (let i = 0; i < data.length; i++) {
+      binary += String.fromCharCode(data[i]);
+    }
+    return btoa(binary);
+  } catch (e) {
+    return btoa(unescape(encodeURIComponent(str)));
+  }
+}
+
+// From SS: parseProxyAddress (renamed from parsePryAddress for clarity; supports socks5/http/direct)
+function parseProxyAddress(serverStr) {
+  if (!serverStr) return null;
+  serverStr = serverStr.trim();
+  if (serverStr.startsWith('socks://') || serverStr.startsWith('socks5://')) {
+    const urlStr = serverStr.replace(/^socks:\/\//, 'socks5://');
+    try {
+      const url = new URL(urlStr);
+      return {
+        type: 'socks5',
+        host: url.hostname,
+        port: parseInt(url.port) || 1080,
+        username: url.username ? decodeURIComponent(url.username) : '',
+        password: url.password ? decodeURIComponent(url.password) : ''
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+  if (serverStr.startsWith('http://') || serverStr.startsWith('https://')) {
+    try {
+      const url = new URL(serverStr);
+      return {
+        type: 'http',
+        host: url.hostname,
+        port: parseInt(url.port) || (serverStr.startsWith('https://') ? 443 : 80),
+        username: url.username ? decodeURIComponent(url.username) : '',
+        password: url.password ? decodeURIComponent(url.password) : ''
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+  if (serverStr.startsWith('[')) {
+    const closeBracket = serverStr.indexOf(']');
+    if (closeBracket > 0) {
+      const host = serverStr.substring(1, closeBracket);
+      const rest = serverStr.substring(closeBracket + 1);
+      if (rest.startsWith(':')) {
+        const port = parseInt(rest.substring(1), 10);
+        if (!isNaN(port) && port > 0 && port <= 65535) {
+          return { type: 'direct', host, port };
+        }
+      }
+      return { type: 'direct', host, port: 443 };
+    }
+  }
+  const lastColonIndex = serverStr.lastIndexOf(':');
+  if (lastColonIndex > 0) {
+    const host = serverStr.substring(0, lastColonIndex);
+    const portStr = serverStr.substring(lastColonIndex + 1);
+    const port = parseInt(portStr, 10);
+    if (!isNaN(port) && port > 0 && port <= 65535) {
+      return { type: 'direct', host, port };
+    }
+  }
+  return { type: 'direct', host: serverStr, port: 443 };
+}
+
+// From SS: connect2Http (new; supports HTTP proxy)
+async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
+  const { host, port, username, password } = proxyConfig;
+  const socket = connect({ hostname: host, port: port });
+  const writer = socket.writable.getWriter();
+  const reader = socket.readable.getReader();
+  try {
+    let connectRequest = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
+    connectRequest += `Host: ${targetHost}:${targetPort}\r\n`;
+    
+    if (username && password) {
+      const auth = btoa(`${username}:${password}`);
+      connectRequest += `Proxy-Authorization: Basic ${auth}\r\n`;
+    }
+    connectRequest += `User-Agent: Mozilla/5.0\r\n`;
+    connectRequest += `Connection: keep-alive\r\n`;
+    connectRequest += '\r\n';
+    await writer.write(new TextEncoder().encode(connectRequest));
+    let responseBuffer = new Uint8Array(0);
+    let headerEndIndex = -1;
+    let bytesRead = 0;
+    const maxHeaderSize = 8192;
+    while (headerEndIndex === -1 && bytesRead < maxHeaderSize) {
+      const { done, value } = await reader.read();
+      if (done) {
+        throw new Error('Connection closed before receiving HTTP response');
+      }
+      const newBuffer = new Uint8Array(responseBuffer.length + value.length);
+      newBuffer.set(responseBuffer);
+      newBuffer.set(value, responseBuffer.length);
+      responseBuffer = newBuffer;
+      bytesRead = responseBuffer.length;
+      
+      for (let i = 0; i < responseBuffer.length - 3; i++) {
+        if (responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a &&
+            responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a) {
+          headerEndIndex = i + 4;
+          break;
+        }
+      }
+    }
+    if (headerEndIndex === -1) {
+      throw new Error('Invalid HTTP response');
+    }
+    const headerText = new TextDecoder().decode(responseBuffer.slice(0, headerEndIndex));
+    const statusLine = headerText.split('\r\n')[0];
+    const statusMatch = statusLine.match(/HTTP\/\d\.\d\s+(\d+)/);
+    if (!statusMatch) {
+      throw new Error(`Invalid response: ${statusLine}`);
+    }
+    const statusCode = parseInt(statusMatch[1]);
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Connection failed: ${statusLine}`);
+    }
+    await writer.write(initialData);
+    writer.releaseLock();
+    reader.releaseLock();
+    return socket;
+  } catch (error) {
+    try { writer.releaseLock(); } catch (e) {}
+    try { reader.releaseLock(); } catch (e) {}
+    try { socket.close(); } catch (e) {}
+    throw error;
+  }
+}
+
+// From SS: connect2Socks5 (similar to existing establishSocksConnection; paste and use if needed, or merge)
+async function connect2Socks5(proxyConfig, targetHost, targetPort, initialData) {
+  const { host, port, username, password } = proxyConfig;
+  const socket = connect({ hostname: host, port: port });
+  const writer = socket.writable.getWriter();
+  const reader = socket.readable.getReader();
+  try {
+    const authMethods = username && password ? 
+      new Uint8Array([0x05, 0x02, 0x00, 0x02]) :
+      new Uint8Array([0x05, 0x01, 0x00]); 
+    
+    await writer.write(authMethods);
+    const methodResponse = await reader.read();
+    if (methodResponse.done || methodResponse.value.byteLength < 2) {
+      throw new Error('S5 method selection failed');
+    }
+    const selectedMethod = new Uint8Array(methodResponse.value)[1];
+    if (selectedMethod === 0x02) {
+      if (!username || !password) {
+        throw new Error('S5 requires authentication');
+      }
+      const userBytes = new TextEncoder().encode(username);
+      const passBytes = new TextEncoder().encode(password);
+      const authPacket = new Uint8Array(3 + userBytes.length + passBytes.length);
+      authPacket[0] = 0x01; 
+      authPacket[1] = userBytes.length;
+      authPacket.set(userBytes, 2);
+      authPacket[2 + userBytes.length] = passBytes.length;
+      authPacket.set(passBytes, 3 + userBytes.length);
+      await writer.write(authPacket);
+      const authResponse = await reader.read();
+      if (authResponse.done || new Uint8Array(authResponse.value)[1] !== 0x00) {
+        throw new Error('S5 authentication failed');
+      }
+    } else if (selectedMethod !== 0x00) {
+      throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
+    }
+    const hostBytes = new TextEncoder().encode(targetHost);
+    const connectPacket = new Uint8Array(7 + hostBytes.length);
+    connectPacket[0] = 0x05;
+    connectPacket[1] = 0x01;
+    connectPacket[2] = 0x00; 
+    connectPacket[3] = 0x03; 
+    connectPacket[4] = hostBytes.length;
+    connectPacket.set(hostBytes, 5);
+    new DataView(connectPacket.buffer).setUint16(5 + hostBytes.length, targetPort, false);
+    await writer.write(connectPacket);
+    const connectResponse = await reader.read();
+    if (connectResponse.done || new Uint8Array(connectResponse.value)[1] !== 0x00) {
+      throw new Error('S5 connection failed');
+    }
+    await writer.write(initialData);
+    writer.releaseLock();
+    reader.releaseLock();
+    return socket;
+  } catch (error) {
+    writer.releaseLock();
+    reader.releaseLock();
+    throw error;
+  }
+}
+
+// From SS: parseSSPacketHeader
+function parseSSPacketHeader(chunk) {
+  if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
+  try {
+    const view = new Uint8Array(chunk);
+    const addressType = view[0];
+    let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
+    switch (addressType) {
+      case 1:
+        addrLen = 4; 
+        hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
+        addrValIdx += addrLen;
+        break;
+      case 3:
+        addrLen = view[addrIdx];
+        addrValIdx += 1; 
+        hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+        addrValIdx += addrLen;
+        break;
+      case 4:
+        addrLen = 16; 
+        const ipv6 = []; 
+        const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+        for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16)); 
+        hostname = ipv6.join(':'); 
+        addrValIdx += addrLen;
+        break;
+      default: 
+        return { hasError: true, message: `Invalid address type: ${addressType}` };
+    }
+    if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+    const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
+    return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
+  } catch (e) {
+    return { hasError: true, message: 'Failed to parse SS packet header' };
+  }
+}
 
     export default {
         async fetch(request, env, ctx) {
@@ -314,6 +559,10 @@
                 
                 at = (env.u || env.U || at).toLowerCase();
                 const subPath = (env.d || env.D || at).toLowerCase();
+                
+                // Update SS configuration immediately after loading UUID from env
+                ssPassword = at;  // Shadowsocks uses same UUID as VLESS/Trojan
+                ssPath = 'ss/' + at;  // Path becomes /ss/UUID
                 
                 const ci = getConfigValue('p', env.p || env.P);
                 let useCustomIP = false;
@@ -424,6 +673,11 @@
                 if (xhttpControl !== undefined && xhttpControl !== '') {
                     ex = xhttpControl === 'yes' || xhttpControl === true || xhttpControl === 'true';
                 }
+                
+                const ssControl = getConfigValue('es', env.es);
+if (ssControl !== undefined && ssControl !== '') {
+    es = ssControl === 'yes' || ssControl === true || ssControl === 'true';
+}
                 
                 scu = getConfigValue('scu', env.scu) || 'https://url.v1.mk/sub';
                 
@@ -570,10 +824,15 @@
                 }
                 return new Response('Internal Server Error', { status: 500 });
             }
+            
+const pathname = url.pathname;
+let customProxyIP = url.searchParams.get('proxyip') || request.headers.get('proxyip') || fallbackAddress;
 
-            if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
-                return await handleWsRequest(request);
-                }
+// All WebSocket requests go to unified handler (auto-detects VLESS/Trojan/SS)
+if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
+    return await handleWsRequest(request);
+}
+
                 
                 if (request.method === 'GET') {
                     // 处理 /{UUID}/region 或 /{自定义路径}/region
@@ -1574,6 +1833,9 @@
             if (et) {
                 finalLinks.push(...await generateTrojanLinksFromSource(list, user, workerDomain, echConfig));
             }
+            if (es) {
+  finalLinks.push(...generateSSLinksFromSource(list, workerDomain, ssPassword));
+}
             if (ex) {
                 finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain, echConfig));
             }
@@ -1898,6 +2160,18 @@
         });
         return links;
     }
+    
+    function generateSSLinksFromSource(list, workerDomain, password) {
+  const links = [];
+  list.forEach(item => {
+    let host = item.ip || item.domain, port = item.port || 443, nodeName = item.isp || item.name || host;
+    const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
+    const wsPath = `/${password}/?ed=2560`;  // Path is just /{UUID}/?ed=2560 (no /ss/ prefix)
+    const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;mux=0`;
+    links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
+  });
+  return links;
+}
 
     async function fetchDynamicIPs() {
         const v4Url1 = "https://www.wetest.vip/page/cloudflare/address_v4.html";
@@ -2041,6 +2315,52 @@
                         }
                     }
                     
+                    // Try Shadowsocks
+                    if (es && chunk.byteLength >= 7) {
+                        const ssResult = parseSSPacketHeader(chunk);
+                        if (!ssResult.hasError) {
+                            protocolType = 'shadowsocks';
+                            const { addressType, port, hostname, rawIndex } = ssResult;
+                            
+                            if (addressType === 2) {
+                                if (port === 53) isDnsQuery = true;
+                                else throw new Error('UDP only supported for DNS');
+                            }
+                            
+                            const rawData = chunk.slice(rawIndex);
+                            if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
+                            
+                            // Connect using proxy if available
+                            const proxyConfig = parseProxyAddress(fallbackAddress);
+                            let remoteSocket;
+                            
+                            if (proxyConfig && proxyConfig.type === 'socks5') {
+                                remoteSocket = await establishSocksConnection(addressType, hostname, port);
+                            } else if (proxyConfig && proxyConfig.type === 'direct') {
+                                remoteSocket = connect({ hostname: proxyConfig.host, port: proxyConfig.port });
+                            } else {
+                                remoteSocket = connect({ hostname: hostname, port: port });
+                            }
+                            
+                            const writer = remoteSocket.writable.getWriter();
+                            await writer.write(rawData);
+                            writer.releaseLock();
+                            
+                            remoteConnWrapper.socket = remoteSocket;
+                            remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+                            
+                            remoteSocket.readable.pipeTo(new WritableStream({
+                                async write(chunk) {
+                                    if (serverSock.readyState === 1) {
+                                        serverSock.send(chunk);
+                                    }
+                                }
+                            })).catch(() => { closeSocketQuietly(serverSock); });
+                            
+                            return;
+                        }
+                    }
+                    
                     throw new Error('Invalid protocol or authentication failed');
                 }
             },
@@ -2048,6 +2368,104 @@
 
         return new Response(null, { status: 101, webSocket: clientSock });
     }
+    
+    async function handleSSRequest(request, customProxyIP) {
+        const webSocketPair = new WebSocketPair();
+        const [clientSocket, serverSocket] = Object.values(webSocketPair);
+        serverSocket.accept();
+        
+        let remoteSocket = null;
+        let isDnsQuery = false;
+        
+        const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+        const readable = makeReadableStream(serverSocket, earlyDataHeader);
+        
+        readable.pipeTo(new WritableStream({
+            async write(chunk) {
+                try {
+                    // DNS forwarding
+                    if (isDnsQuery) {
+                        await forwardUDP(chunk, serverSocket, null);
+                        return;
+                    }
+                    
+                    // If already connected, forward data
+                    if (remoteSocket) {
+                        const writer = remoteSocket.writable.getWriter();
+                        await writer.write(chunk);
+                        writer.releaseLock();
+                        return;
+                    }
+                    
+                    // Parse SS packet header
+                    const { hasError, message, addressType, port, hostname, rawIndex } = parseSSPacketHeader(chunk);
+                    if (hasError) {
+                        console.error('SS packet error:', message);
+                        closeSocketQuietly(serverSocket);
+                        return;
+                    }
+                    
+                    // Handle UDP (DNS only)
+                    if (addressType === 2) {
+                        if (port === 53) {
+                            isDnsQuery = true;
+                            const rawData = chunk.slice(rawIndex);
+                            await forwardUDP(rawData, serverSocket, null);
+                            return;
+                        } else {
+                            console.error('UDP only for DNS');
+                            closeSocketQuietly(serverSocket);
+                            return;
+                        }
+                    }
+                    
+                    // Forward TCP with proper proxy support
+                    const rawData = chunk.slice(rawIndex);
+                    
+                    // Parse proxy config
+                    const proxyConfig = parseProxyAddress(customProxyIP);
+                    
+                    // Connect (with proxy or direct)
+                    if (proxyConfig && proxyConfig.type === 'socks5') {
+                        remoteSocket = await establishSocksConnection(addressType, hostname, port);
+                    } else if (proxyConfig && proxyConfig.type === 'direct') {
+                        remoteSocket = connect({ hostname: proxyConfig.host, port: proxyConfig.port });
+                    } else {
+                        remoteSocket = connect({ hostname: hostname, port: port });
+                    }
+                    
+                    // Send initial data
+                    const writer = remoteSocket.writable.getWriter();
+                    await writer.write(rawData);
+                    writer.releaseLock();
+                    
+                    // Setup cleanup
+                    remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSocket));
+                    
+                    // Pipe remote → websocket (non-blocking)
+                    remoteSocket.readable.pipeTo(new WritableStream({
+                        async write(chunk) {
+                            if (serverSocket.readyState === 1) {
+                                serverSocket.send(chunk);
+                            }
+                        }
+                    })).catch(() => {
+                        closeSocketQuietly(serverSocket);
+                    });
+                    
+                } catch (error) {
+                    console.error('SS error:', error);
+                    closeSocketQuietly(serverSocket);
+                }
+            }
+        })).catch((error) => {
+            console.error('SS pipe error:', error);
+            closeSocketQuietly(serverSocket);
+        });
+        
+        return new Response(null, { status: 101, webSocket: clientSocket });
+    }
+
 
     async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
         async function connectAndSend(address, port, useSocks = false) {
@@ -2854,6 +3272,12 @@
                                             <span style="font-size: 1.1rem;">${t.enableXhttp}</span>
                                     </label>
                                 </div>
+                                <div style="margin-bottom: 10px;">
+  <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
+    <input type="checkbox" id="es" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+    <span style="font-size: 1.1rem;">启用 Shadowsocks</span>
+  </label>
+</div>
                                 <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(0, 255, 0, 0.3);">
                                     <div style="margin-bottom: 10px;">
                                         <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
@@ -3834,6 +4258,7 @@
                     document.getElementById('ev').checked = config.ev !== 'no';
                     document.getElementById('et').checked = config.et === 'yes';
                     document.getElementById('ex').checked = config.ex === 'yes';
+                    document.getElementById('es').checked = config.es === 'yes';
                     document.getElementById('ech').checked = config.ech === 'yes';
                     document.getElementById('tp').value = config.tp || '';
                     if (document.getElementById('customDNS')) {
@@ -4127,6 +4552,7 @@
                             ev: document.getElementById('ev').checked ? 'yes' : 'no', 
                             et: document.getElementById('et').checked ? 'yes' : 'no', 
                             ex: document.getElementById('ex').checked ? 'yes' : 'no', 
+                            es: document.getElementById('es').checked ? 'yes' : 'no',
                             ech: document.getElementById('ech').checked ? 'yes' : 'no',
                             tp: document.getElementById('tp').value,
                             customDNS: document.getElementById('customDNS').value,
@@ -4135,7 +4561,8 @@
                         
                         if (!document.getElementById('ev').checked && 
                             !document.getElementById('et').checked && 
-                            !document.getElementById('ex').checked) {
+                            !document.getElementById('ex').checked &&
+                            !document.getElementById('es').checked) {
                             alert('至少需要启用一个协议！');
                             return;
                         }
@@ -4148,7 +4575,7 @@
                 if (otherConfigForm) {
                     otherConfigForm.addEventListener('submit', async function(e) {
                         e.preventDefault();
-                        const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', ech: document.getElementById('ech').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
+                        const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', es: document.getElementById('es').checked ? 'yes' : 'no', ech: document.getElementById('ech').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
                             d: document.getElementById('customPath').value,
                             p: document.getElementById('customIP').value,
                             yx: document.getElementById('yx').value,
@@ -4162,7 +4589,8 @@
                         // 确保至少选择一个协议
                         if (!document.getElementById('ev').checked && 
                             !document.getElementById('et').checked && 
-                            !document.getElementById('ex').checked) {
+                            !document.getElementById('ex').checked &&
+                            !document.getElementById('es').checked) {
                             alert('至少需要启用一个协议！');
                             return;
                         }
@@ -6093,6 +6521,13 @@
         }
         
         tp = getConfigValue('tp', '') || '';
+        
+        const ssControl = getConfigValue('es', '');
+        if (ssControl !== undefined && ssControl !== '') {
+            es = ssControl === 'yes' || ssControl === true || ssControl === 'true';
+        }
+        ssPassword = at;  // Always sync with at
+        ssPath = 'ss/' + at;
         
         const xhttpControl = getConfigValue('ex', '');
         if (xhttpControl !== undefined && xhttpControl !== '') {
