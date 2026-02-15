@@ -2183,7 +2183,7 @@ function generateSSLinksFromSource(list, workerDomain, password) {
         const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
         const wsPath = `/${password}/?ed=2560`;
 
-        const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=h2;mux=0`;
+        const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=http/1.1;mux=0`;
 
         links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
     });
