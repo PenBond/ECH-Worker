@@ -2173,17 +2173,21 @@ if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
         return links;
     }
     
-    function generateSSLinksFromSource(list, workerDomain, password) {
-  const links = [];
-  list.forEach(item => {
-    let host = item.ip || item.domain, port = item.port || 443;
-    let nodeName = item.isp || item.name || host;
-    const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
-    const wsPath = `/${password}/?ed=2560`;
-    const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;alpn=h3,h2,http/1.1;mux=0`;
-    links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
-  });
-  return links;
+function generateSSLinksFromSource(list, workerDomain, password) {
+    const links = [];
+    list.forEach(item => {
+        let host = item.ip || item.domain || item.host;
+        let port = item.port || 443;
+        let nodeName = item.isp || item.name || item.colo || host;
+
+        const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
+        const wsPath = `/${password}/?ed=2560`;
+
+        const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=h2;mux=0`;
+
+        links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
+    });
+    return links;
 }
 
     async function fetchDynamicIPs() {
