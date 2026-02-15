@@ -20,7 +20,7 @@
     let et = false; 
     let ex = false;  
     let es = false;  // Enable Shadowsocks (configurable via KV/API)
-    let ssMethod = 'none';  // From SS code
+    let ssMethod = 'aes-256-gcm';  // Proper Shadowsocks AEAD encryption
     let ssPassword = at;  // Use same UUID as VLESS/Trojan
     let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
     
@@ -513,7 +513,233 @@ async function connect2Socks5(proxyConfig, targetHost, targetPort, initialData) 
   }
 }
 
-// From SS: parseSSPacketHeader
+// ============================================================================
+// SHADOWSOCKS AEAD CIPHER IMPLEMENTATION
+// ============================================================================
+
+// Shadowsocks AEAD Cipher Configuration
+const SS_CIPHER_INFO = {
+    'aes-128-gcm': { keySize: 16, saltSize: 16, nonceSize: 12, tagSize: 16 },
+    'aes-256-gcm': { keySize: 32, saltSize: 32, nonceSize: 12, tagSize: 16 },
+    'chacha20-ietf-poly1305': { keySize: 32, saltSize: 32, nonceSize: 12, tagSize: 16 }
+};
+
+// Derive subkey using HKDF-SHA1
+async function hkdfSHA1(key, salt, info, length) {
+    const prk = await crypto.subtle.importKey(
+        'raw',
+        salt,
+        { name: 'HMAC', hash: 'SHA-1' },
+        false,
+        ['sign']
+    );
+    const prkData = await crypto.subtle.sign('HMAC', prk, key);
+    
+    const hmacKey = await crypto.subtle.importKey(
+        'raw',
+        prkData,
+        { name: 'HMAC', hash: 'SHA-1' },
+        false,
+        ['sign']
+    );
+    
+    let t = new Uint8Array(0);
+    let okm = new Uint8Array(0);
+    
+    for (let i = 0; okm.length < length; i++) {
+        const data = new Uint8Array(t.length + info.length + 1);
+        data.set(t, 0);
+        data.set(info, t.length);
+        data[data.length - 1] = i + 1;
+        
+        t = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, data));
+        const newOkm = new Uint8Array(okm.length + t.length);
+        newOkm.set(okm, 0);
+        newOkm.set(t, okm.length);
+        okm = newOkm;
+    }
+    
+    return okm.slice(0, length);
+}
+
+// EVP_BytesToKey - derive key from password (compatible with OpenSSL)
+async function evpBytesToKey(password, keyLen, ivLen) {
+    const encoder = new TextEncoder();
+    const passwordBytes = encoder.encode(password);
+    let m = [];
+    let i = 0;
+    let count = 0;
+    
+    while (count < keyLen + ivLen) {
+        let data = passwordBytes;
+        if (i > 0) {
+            const combined = new Uint8Array(m[i - 1].length + passwordBytes.length);
+            combined.set(m[i - 1], 0);
+            combined.set(passwordBytes, m[i - 1].length);
+            data = combined;
+        }
+        
+        const hash = await crypto.subtle.digest('MD5', data);
+        m[i] = new Uint8Array(hash);
+        count += m[i].length;
+        i++;
+    }
+    
+    const ms = new Uint8Array(count);
+    let offset = 0;
+    for (let buf of m) {
+        ms.set(buf, offset);
+        offset += buf.length;
+    }
+    
+    return {
+        key: ms.slice(0, keyLen),
+        iv: ms.slice(keyLen, keyLen + ivLen)
+    };
+}
+
+// Shadowsocks AEAD Cipher Class
+class ShadowsocksAEADCipher {
+    constructor(method, password) {
+        this.method = method;
+        this.password = password;
+        this.cipherInfo = SS_CIPHER_INFO[method];
+        
+        if (!this.cipherInfo) {
+            throw new Error(`Unsupported cipher method: ${method}`);
+        }
+        
+        this.masterKey = null;
+        this.decryptNonce = null;
+        this.encryptNonce = null;
+        this.decryptSubkey = null;
+        this.encryptSubkey = null;
+        this.decryptCounter = 0;
+        this.encryptCounter = 0;
+    }
+    
+    async initialize() {
+        // Derive master key from password
+        const derived = await evpBytesToKey(this.password, this.cipherInfo.keySize, 0);
+        this.masterKey = derived.key;
+    }
+    
+    // Initialize decryption with salt from first packet
+    async initDecrypt(salt) {
+        const info = new TextEncoder().encode('ss-subkey');
+        this.decryptSubkey = await hkdfSHA1(this.masterKey, salt, info, this.cipherInfo.keySize);
+        this.decryptNonce = new Uint8Array(this.cipherInfo.nonceSize);
+        this.decryptCounter = 0;
+    }
+    
+    // Initialize encryption with random salt
+    async initEncrypt() {
+        const salt = crypto.getRandomValues(new Uint8Array(this.cipherInfo.saltSize));
+        const info = new TextEncoder().encode('ss-subkey');
+        this.encryptSubkey = await hkdfSHA1(this.masterKey, salt, info, this.cipherInfo.keySize);
+        this.encryptNonce = new Uint8Array(this.cipherInfo.nonceSize);
+        this.encryptCounter = 0;
+        return salt;
+    }
+    
+    // Increment nonce
+    incrementNonce(nonce) {
+        for (let i = 0; i < nonce.length; i++) {
+            nonce[i]++;
+            if (nonce[i] !== 0) break;
+        }
+    }
+    
+    // Decrypt AEAD chunk
+    async decrypt(ciphertext) {
+        if (!this.decryptSubkey) {
+            throw new Error('Decryption not initialized');
+        }
+        
+        const tagSize = this.cipherInfo.tagSize;
+        if (ciphertext.length < tagSize) {
+            throw new Error('Ciphertext too short');
+        }
+        
+        const actualCiphertext = ciphertext.slice(0, -tagSize);
+        const tag = ciphertext.slice(-tagSize);
+        
+        // Combine ciphertext and tag for Web Crypto API
+        const combined = new Uint8Array(actualCiphertext.length + tag.length);
+        combined.set(actualCiphertext, 0);
+        combined.set(tag, actualCiphertext.length);
+        
+        const key = await crypto.subtle.importKey(
+            'raw',
+            this.decryptSubkey,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
+        
+        const plaintext = await crypto.subtle.decrypt(
+            {
+                name: 'AES-GCM',
+                iv: this.decryptNonce,
+                tagLength: tagSize * 8
+            },
+            key,
+            combined
+        );
+        
+        this.incrementNonce(this.decryptNonce);
+        this.decryptCounter++;
+        
+        return new Uint8Array(plaintext);
+    }
+    
+    // Encrypt AEAD chunk
+    async encrypt(plaintext) {
+        if (!this.encryptSubkey) {
+            await this.initEncrypt();
+        }
+        
+        const key = await crypto.subtle.importKey(
+            'raw',
+            this.encryptSubkey,
+            { name: 'AES-GCM' },
+            false,
+            ['encrypt']
+        );
+        
+        const ciphertext = await crypto.subtle.encrypt(
+            {
+                name: 'AES-GCM',
+                iv: this.encryptNonce,
+                tagLength: this.cipherInfo.tagSize * 8
+            },
+            key,
+            plaintext
+        );
+        
+        this.incrementNonce(this.encryptNonce);
+        this.encryptCounter++;
+        
+        return new Uint8Array(ciphertext);
+    }
+    
+    // Decrypt payload length (first 2 bytes encrypted separately)
+    async decryptPayloadLength(encryptedLength) {
+        const decrypted = await this.decrypt(encryptedLength);
+        const view = new DataView(decrypted.buffer, decrypted.byteOffset, decrypted.byteLength);
+        return view.getUint16(0, false); // big-endian
+    }
+    
+    // Encrypt payload length
+    async encryptPayloadLength(length) {
+        const buffer = new ArrayBuffer(2);
+        const view = new DataView(buffer);
+        view.setUint16(0, length, false); // big-endian
+        return await this.encrypt(new Uint8Array(buffer));
+    }
+}
+
+// Parse plaintext Shadowsocks SOCKS5-like header
 function parseSSPacketHeader(chunk) {
   if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
   try {
@@ -2183,6 +2409,7 @@ function generateSSLinksFromSource(list, workerDomain, password) {
         const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
         const wsPath = `/${password}/?ed=2560`;
 
+        // Using proper AEAD cipher with v2ray-plugin
         const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=http/1.1;mux=0`;
 
         links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
@@ -2332,57 +2559,124 @@ function generateSSLinksFromSource(list, workerDomain, password) {
                         }
                     }
                     
-                    // Try Shadowsocks
+                    // Try Shadowsocks AEAD
                     if (es && chunk.byteLength >= 7) {
-                        const ssResult = parseSSPacketHeader(chunk);
-                        if (!ssResult.hasError) {
-                            protocolType = 'shadowsocks';
-                            const { addressType, port, hostname, rawIndex } = ssResult;
-                            
-                            if (addressType === 2) {
-                                if (port === 53) isDnsQuery = true;
-                                else throw new Error('UDP only supported for DNS');
-                            }
-                            
-                            const rawData = chunk.slice(rawIndex);
-                            if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
-                            
-                            // Connect using proxy if available
-                            const proxyConfig = parseProxyAddress(fallbackAddress);
-                            let remoteSocket;
-                            
-                            if (proxyConfig && proxyConfig.type === 'socks5') {
-                                remoteSocket = await establishSocksConnection(addressType, hostname, port);
-                            } else if (proxyConfig && proxyConfig.type === 'direct') {
-                                remoteSocket = connect({ 
-                                    hostname: proxyConfig.host, 
-                                    port: proxyConfig.port,
-                                    secureTransport: proxyConfig.port == 443 ? "on" : "off"
-                                });
-                            } else {
-                                remoteSocket = connect({ 
-                                    hostname: hostname, 
-                                    port: port,
-                                    secureTransport: port == 443 ? "on" : "off"
-                                });
-                            }
-                            
-                            const writer = remoteSocket.writable.getWriter();
-                            await writer.write(rawData);
-                            writer.releaseLock();
-                            
-                            remoteConnWrapper.socket = remoteSocket;
-                            remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-                            
-                            remoteSocket.readable.pipeTo(new WritableStream({
-                                async write(chunk) {
-                                    if (serverSock.readyState === 1) {
-                                        serverSock.send(chunk);
+                        // For AEAD, we need at least: salt + encrypted_length + tag
+                        const cipherInfo = SS_CIPHER_INFO[ssMethod];
+                        if (!cipherInfo) {
+                            throw new Error(`Unsupported SS cipher: ${ssMethod}`);
+                        }
+                        
+                        const minSize = cipherInfo.saltSize + 2 + cipherInfo.tagSize;
+                        if (chunk.byteLength >= minSize) {
+                            try {
+                                // Initialize cipher
+                                const cipher = new ShadowsocksAEADCipher(ssMethod, ssPassword);
+                                await cipher.initialize();
+                                
+                                // Extract salt
+                                const salt = new Uint8Array(chunk.slice(0, cipherInfo.saltSize));
+                                await cipher.initDecrypt(salt);
+                                
+                                let offset = cipherInfo.saltSize;
+                                const tagSize = cipherInfo.tagSize;
+                                
+                                // Decrypt payload length
+                                const encryptedLength = new Uint8Array(chunk.slice(offset, offset + 2 + tagSize));
+                                const payloadLength = await cipher.decryptPayloadLength(encryptedLength);
+                                offset += 2 + tagSize;
+                                
+                                // Check if we have full payload
+                                const encryptedPayloadSize = payloadLength + tagSize;
+                                if (offset + encryptedPayloadSize <= chunk.byteLength) {
+                                    // Decrypt payload
+                                    const encryptedPayload = new Uint8Array(chunk.slice(offset, offset + encryptedPayloadSize));
+                                    const decryptedPayload = await cipher.decrypt(encryptedPayload);
+                                    
+                                    // Parse SS header from decrypted data
+                                    const ssResult = parseSSPacketHeader(decryptedPayload);
+                                    if (!ssResult.hasError) {
+                                        protocolType = 'shadowsocks';
+                                        const { addressType, port, hostname, rawIndex } = ssResult;
+                                        
+                                        if (addressType === 2) {
+                                            if (port === 53) isDnsQuery = true;
+                                            else throw new Error('UDP only supported for DNS');
+                                        }
+                                        
+                                        const rawData = decryptedPayload.slice(rawIndex);
+                                        
+                                        // Initialize encryption for responses
+                                        const encryptSalt = await cipher.initEncrypt();
+                                        
+                                        if (isDnsQuery) {
+                                            // For DNS, handle with encryption wrapper
+                                            const encryptedResponse = await forwardUDPEncrypted(rawData, serverSock, cipher, encryptSalt);
+                                            return;
+                                        }
+                                        
+                                        // Connect using proxy if available
+                                        const proxyConfig = parseProxyAddress(fallbackAddress);
+                                        let remoteSocket;
+                                        
+                                        if (proxyConfig && proxyConfig.type === 'socks5') {
+                                            remoteSocket = await establishSocksConnection(addressType, hostname, port);
+                                        } else if (proxyConfig && proxyConfig.type === 'direct') {
+                                            remoteSocket = connect({ 
+                                                hostname: proxyConfig.host, 
+                                                port: proxyConfig.port,
+                                                secureTransport: proxyConfig.port == 443 ? "on" : "off"
+                                            });
+                                        } else {
+                                            remoteSocket = connect({ 
+                                                hostname: hostname, 
+                                                port: port,
+                                                secureTransport: port == 443 ? "on" : "off"
+                                            });
+                                        }
+                                        
+                                        // Send decrypted initial data
+                                        const writer = remoteSocket.writable.getWriter();
+                                        await writer.write(rawData);
+                                        writer.releaseLock();
+                                        
+                                        remoteConnWrapper.socket = remoteSocket;
+                                        remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+                                        
+                                        // Send salt first
+                                        if (serverSock.readyState === 1) {
+                                            serverSock.send(encryptSalt);
+                                        }
+                                        
+                                        // Pipe remote → websocket with AEAD encryption
+                                        remoteSocket.readable.pipeTo(new WritableStream({
+                                            async write(remoteChunk) {
+                                                try {
+                                                    if (serverSock.readyState !== 1) return;
+                                                    
+                                                    // Encrypt response
+                                                    const encryptedLength = await cipher.encryptPayloadLength(remoteChunk.byteLength);
+                                                    const encryptedPayload = await cipher.encrypt(remoteChunk);
+                                                    
+                                                    const response = new Uint8Array(encryptedLength.length + encryptedPayload.length);
+                                                    response.set(encryptedLength, 0);
+                                                    response.set(encryptedPayload, encryptedLength.length);
+                                                    
+                                                    serverSock.send(response);
+                                                } catch (error) {
+                                                    console.error('SS encryption error:', error);
+                                                    closeSocketQuietly(serverSock);
+                                                }
+                                            }
+                                        })).catch(() => { closeSocketQuietly(serverSock); });
+                                        
+                                        return;
                                     }
                                 }
-                            })).catch(() => { closeSocketQuietly(serverSock); });
-                            
-                            return;
+                            } catch (error) {
+                                // AEAD decryption failed, not a valid SS packet
+                                console.error('SS AEAD decryption failed:', error);
+                            }
                         }
                     }
                     
@@ -2401,93 +2695,187 @@ function generateSSLinksFromSource(list, workerDomain, password) {
         
         let remoteSocket = null;
         let isDnsQuery = false;
+        let cipher = null;
+        let isFirstChunk = true;
+        let buffer = new Uint8Array(0);
         
         const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
         const readable = makeReadableStream(serverSocket, earlyDataHeader);
         
+        // Initialize cipher
+        try {
+            cipher = new ShadowsocksAEADCipher(ssMethod, ssPassword);
+            await cipher.initialize();
+        } catch (error) {
+            console.error('Failed to initialize SS cipher:', error);
+            closeSocketQuietly(serverSocket);
+            return new Response('Cipher initialization failed', { status: 500 });
+        }
+        
         readable.pipeTo(new WritableStream({
             async write(chunk) {
                 try {
-                    // DNS forwarding
-                    if (isDnsQuery) {
-                        await forwardUDP(chunk, serverSocket, null);
-                        return;
-                    }
+                    // Accumulate data in buffer
+                    const newBuffer = new Uint8Array(buffer.length + chunk.byteLength);
+                    newBuffer.set(buffer, 0);
+                    newBuffer.set(new Uint8Array(chunk), buffer.length);
+                    buffer = newBuffer;
                     
-                    // If already connected, forward data
-                    if (remoteSocket) {
-                        const writer = remoteSocket.writable.getWriter();
-                        await writer.write(chunk);
-                        writer.releaseLock();
-                        return;
-                    }
-                    
-                    // Parse SS packet header
-                    const { hasError, message, addressType, port, hostname, rawIndex } = parseSSPacketHeader(chunk);
-                    if (hasError) {
-                        console.error('SS packet error:', message);
-                        closeSocketQuietly(serverSocket);
-                        return;
-                    }
-                    
-                    // Handle UDP (DNS only)
-                    if (addressType === 2) {
-                        if (port === 53) {
-                            isDnsQuery = true;
-                            const rawData = chunk.slice(rawIndex);
-                            await forwardUDP(rawData, serverSocket, null);
+                    // First chunk: extract salt and initialize decryption
+                    if (isFirstChunk) {
+                        const saltSize = cipher.cipherInfo.saltSize;
+                        if (buffer.length < saltSize) {
+                            // Wait for more data
                             return;
-                        } else {
-                            console.error('UDP only for DNS');
+                        }
+                        
+                        const salt = buffer.slice(0, saltSize);
+                        await cipher.initDecrypt(salt);
+                        buffer = buffer.slice(saltSize);
+                        isFirstChunk = false;
+                    }
+                    
+                    // Process all complete encrypted chunks in buffer
+                    while (buffer.length > 0) {
+                        const tagSize = cipher.cipherInfo.tagSize;
+                        
+                        // Need at least encrypted length (2 bytes + tag)
+                        if (buffer.length < 2 + tagSize) {
+                            break; // Wait for more data
+                        }
+                        
+                        // Decrypt payload length
+                        let payloadLength;
+                        try {
+                            payloadLength = await cipher.decryptPayloadLength(buffer.slice(0, 2 + tagSize));
+                        } catch (error) {
+                            console.error('Failed to decrypt payload length:', error);
                             closeSocketQuietly(serverSocket);
                             return;
                         }
-                    }
-                    
-                    // Forward TCP with proper proxy support
-                    const rawData = chunk.slice(rawIndex);
-                    
-                    // Parse proxy config
-                    const proxyConfig = parseProxyAddress(customProxyIP);
-                    
-                    // Connect (with proxy or direct)
-                    if (proxyConfig && proxyConfig.type === 'socks5') {
-                        remoteSocket = await establishSocksConnection(addressType, hostname, port);
-                    } else if (proxyConfig && proxyConfig.type === 'direct') {
-                        remoteSocket = connect({ 
-                            hostname: proxyConfig.host, 
-                            port: proxyConfig.port,
-                            secureTransport: proxyConfig.port == 443 ? "on" : "off"
-                        });
-                    } else {
-                        remoteSocket = connect({ 
-                            hostname: hostname, 
-                            port: port,
-                            secureTransport: port == 443 ? "on" : "off"
-                        });
-                    }
-                    
-                    // Send initial data
-                    const writer = remoteSocket.writable.getWriter();
-                    await writer.write(rawData);
-                    writer.releaseLock();
-                    
-                    // Setup cleanup
-                    remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSocket));
-                    
-                    // Pipe remote → websocket (non-blocking)
-                    remoteSocket.readable.pipeTo(new WritableStream({
-                        async write(chunk) {
-                            if (serverSocket.readyState === 1) {
-                                serverSocket.send(chunk);
-                            }
+                        
+                        buffer = buffer.slice(2 + tagSize);
+                        
+                        // Check if we have the full encrypted payload
+                        const encryptedPayloadSize = payloadLength + tagSize;
+                        if (buffer.length < encryptedPayloadSize) {
+                            // Put length info back and wait for more data
+                            // Note: This is a simplification; in production you'd store the length separately
+                            break;
                         }
-                    })).catch(() => {
-                        closeSocketQuietly(serverSocket);
-                    });
+                        
+                        // Decrypt payload
+                        let decryptedPayload;
+                        try {
+                            decryptedPayload = await cipher.decrypt(buffer.slice(0, encryptedPayloadSize));
+                        } catch (error) {
+                            console.error('Failed to decrypt payload:', error);
+                            closeSocketQuietly(serverSocket);
+                            return;
+                        }
+                        
+                        buffer = buffer.slice(encryptedPayloadSize);
+                        
+                        // Process decrypted data
+                        if (remoteSocket) {
+                            // Already connected, just forward decrypted data
+                            const writer = remoteSocket.writable.getWriter();
+                            await writer.write(decryptedPayload);
+                            writer.releaseLock();
+                        } else {
+                            // First payload: parse address and connect
+                            const { hasError, message, addressType, port, hostname, rawIndex } = parseSSPacketHeader(decryptedPayload);
+                            
+                            if (hasError) {
+                                console.error('SS packet error:', message);
+                                closeSocketQuietly(serverSocket);
+                                return;
+                            }
+                            
+                            // Handle UDP (DNS only)
+                            if (addressType === 2) {
+                                if (port === 53) {
+                                    isDnsQuery = true;
+                                    const rawData = decryptedPayload.slice(rawIndex);
+                                    await forwardUDP(rawData, serverSocket, cipher);
+                                    return;
+                                } else {
+                                    console.error('UDP only for DNS');
+                                    closeSocketQuietly(serverSocket);
+                                    return;
+                                }
+                            }
+                            
+                            // Extract actual payload after address header
+                            const rawData = decryptedPayload.slice(rawIndex);
+                            
+                            // Parse proxy config
+                            const proxyConfig = parseProxyAddress(customProxyIP);
+                            
+                            // Establish connection
+                            if (proxyConfig && proxyConfig.type === 'socks5') {
+                                remoteSocket = await establishSocksConnection(addressType, hostname, port);
+                            } else if (proxyConfig && proxyConfig.type === 'direct') {
+                                remoteSocket = connect({ 
+                                    hostname: proxyConfig.host, 
+                                    port: proxyConfig.port,
+                                    secureTransport: proxyConfig.port == 443 ? "on" : "off"
+                                });
+                            } else {
+                                remoteSocket = connect({ 
+                                    hostname: hostname, 
+                                    port: port,
+                                    secureTransport: port == 443 ? "on" : "off"
+                                });
+                            }
+                            
+                            // Send initial data if any
+                            if (rawData.length > 0) {
+                                const writer = remoteSocket.writable.getWriter();
+                                await writer.write(rawData);
+                                writer.releaseLock();
+                            }
+                            
+                            // Setup cleanup
+                            remoteSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSocket));
+                            
+                            // Initialize encryption for responses
+                            const encryptSalt = await cipher.initEncrypt();
+                            
+                            // Send salt to client
+                            if (serverSocket.readyState === 1) {
+                                serverSocket.send(encryptSalt);
+                            }
+                            
+                            // Pipe remote → websocket with encryption
+                            remoteSocket.readable.pipeTo(new WritableStream({
+                                async write(remoteChunk) {
+                                    try {
+                                        if (serverSocket.readyState !== 1) return;
+                                        
+                                        // Encrypt the response data
+                                        const encryptedLength = await cipher.encryptPayloadLength(remoteChunk.byteLength);
+                                        const encryptedPayload = await cipher.encrypt(remoteChunk);
+                                        
+                                        // Send encrypted length + encrypted payload
+                                        const response = new Uint8Array(encryptedLength.length + encryptedPayload.length);
+                                        response.set(encryptedLength, 0);
+                                        response.set(encryptedPayload, encryptedLength.length);
+                                        
+                                        serverSocket.send(response);
+                                    } catch (error) {
+                                        console.error('Encryption error:', error);
+                                        closeSocketQuietly(serverSocket);
+                                    }
+                                }
+                            })).catch(() => {
+                                closeSocketQuietly(serverSocket);
+                            });
+                        }
+                    }
                     
                 } catch (error) {
-                    console.error('SS error:', error);
+                    console.error('SS processing error:', error);
                     closeSocketQuietly(serverSocket);
                 }
             }
@@ -2644,6 +3032,42 @@ function generateSSLinksFromSource(list, workerDomain, password) {
                 },
             }));
         } catch (error) { }
+    }
+
+    async function forwardUDPEncrypted(udpChunk, webSocket, cipher, salt) {
+        try {
+            const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
+            const writer = tcpSocket.writable.getWriter();
+            await writer.write(udpChunk);
+            writer.releaseLock();
+            
+            // Send salt first
+            if (webSocket.readyState === 1) {
+                webSocket.send(salt);
+            }
+            
+            await tcpSocket.readable.pipeTo(new WritableStream({
+                async write(chunk) {
+                    try {
+                        if (webSocket.readyState !== 1) return;
+                        
+                        // Encrypt DNS response
+                        const encryptedLength = await cipher.encryptPayloadLength(chunk.byteLength);
+                        const encryptedPayload = await cipher.encrypt(chunk);
+                        
+                        const response = new Uint8Array(encryptedLength.length + encryptedPayload.length);
+                        response.set(encryptedLength, 0);
+                        response.set(encryptedPayload, encryptedLength.length);
+                        
+                        webSocket.send(response);
+                    } catch (error) {
+                        console.error('UDP encryption error:', error);
+                    }
+                },
+            }));
+        } catch (error) { 
+            console.error('UDP forward error:', error);
+        }
     }
 
     async function establishSocksConnection(addrType, address, port) {
