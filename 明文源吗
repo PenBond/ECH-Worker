@@ -1,5 +1,5 @@
-// CFnew - 终端 v8.9.1
-    // 版本: v8.9.1
+// CFnew - 终端 v2.9.3
+    // 版本: v2.9.3
     import { connect } from 'cloudflare:sockets';
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
@@ -17,9 +17,9 @@
     let cp = '';  
 
     let ev = true;   
-    let et = true; 
-    let ex = true;
-    let es = true;  // Enable Shadowsocks (configurable via KV/API)
+    let et = false; 
+    let ex = false;
+    let es = false;  // Enable Shadowsocks (configurable via KV/API)
     let ssMethod = 'none';  // Shadowsocks encryption method
     let ssPassword = at;  // Use same UUID as VLESS/Trojan
     let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
@@ -1625,11 +1625,42 @@
         const esParam = url.searchParams.get('es');
         const exParam = url.searchParams.get('ex');
         
-        // Use URL params if provided, otherwise use global config
-        const useVLESS = evParam !== null ? (evParam === 'true' || evParam === '1' || evParam === 'yes') : ev;
-        const useTrojan = etParam !== null ? (etParam === 'true' || etParam === '1' || etParam === 'yes') : et;
-        const useShadowsocks = esParam !== null ? (esParam === 'true' || esParam === '1' || esParam === 'yes') : es;
-        const useXhttp = exParam !== null ? (exParam === 'true' || exParam === '1' || exParam === 'yes') : ex;
+        // Smart protocol filtering based on target
+        let useVLESS, useTrojan, useShadowsocks, useXhttp;
+        
+        // If target specifies a specific protocol, only use that protocol
+        const lowerTarget = target.toLowerCase();
+        if (lowerTarget === 'trojan') {
+            // Only Trojan protocol
+            useVLESS = false;
+            useTrojan = true;
+            useShadowsocks = false;
+            useXhttp = false;
+        } else if (lowerTarget === 'ss' || lowerTarget === 'shadowsocks') {
+            // Only Shadowsocks protocol
+            useVLESS = false;
+            useTrojan = false;
+            useShadowsocks = true;
+            useXhttp = false;
+        } else if (lowerTarget === 'vless') {
+            // Only VLESS protocol
+            useVLESS = true;
+            useTrojan = false;
+            useShadowsocks = false;
+            useXhttp = false;
+        } else if (lowerTarget === 'xhttp') {
+            // Only xhttp protocol
+            useVLESS = false;
+            useTrojan = false;
+            useShadowsocks = false;
+            useXhttp = true;
+        } else {
+            // Default: Use URL params if provided, otherwise use global config
+            useVLESS = evParam !== null ? (evParam === 'true' || evParam === '1' || evParam === 'yes') : ev;
+            useTrojan = etParam !== null ? (etParam === 'true' || etParam === '1' || etParam === 'yes') : et;
+            useShadowsocks = esParam !== null ? (esParam === 'true' || esParam === '1' || esParam === 'yes') : es;
+            useXhttp = exParam !== null ? (exParam === 'true' || exParam === '1' || exParam === 'yes') : ex;
+        }
 
         // 如果启用了ECH，使用自定义值
         let echConfig = null;
@@ -2285,7 +2316,7 @@
 
     async function forwardUDP(udpChunk, webSocket, respHeader) {
         try {
-            const tcpSocket = connect({ hostname: '1.1.1.1', port: 53 });
+            const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
             let header = respHeader;
             const writer = tcpSocket.writable.getWriter();
             await writer.write(udpChunk);
@@ -2496,7 +2527,7 @@
                         KR: '🇰🇷 韩国', DE: '🇩🇪 德国', SE: '🇸🇪 瑞典', NL: '🇳🇱 荷兰',
                         FI: '🇫🇮 芬兰', GB: '🇬🇧 英国'
                     },
-                    terminal: '终端 v8.9.1',
+                    terminal: '终端 v2.9.3',
                     githubProject: 'GitHub 项目',
                     autoDetectClient: '自动识别',
                 selectionLogicText: '同地区 → 邻近地区 → 其他地区',
@@ -2636,7 +2667,7 @@
                         KR: '🇰🇷 کره جنوبی', DE: '🇩🇪 آلمان', SE: '🇸🇪 سوئد', NL: '🇳🇱 هلند',
                         FI: '🇫🇮 فنلاند', GB: '🇬🇧 بریتانیا'
                     },
-                    terminal: 'ترمینال v8.9.1',
+                    terminal: 'ترمینال v2.9.3',
                     githubProject: 'پروژه GitHub',
                     autoDetectClient: 'تشخیص خودکار',
                 selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
@@ -2905,6 +2936,17 @@
                     <button class="client-btn" onclick="generateClientLink(atob('djJyYXk='), 'Shadowrocket')">Shadowrocket</button>
                 </div>
                 <div class=atob('c3Vic2NyaXB0aW9uLXVybA==') id="clientSubscriptionUrl"></div>
+            </div>
+            <div class="card">
+                    <h2 class="card-title">[ 按协议选择 Protocol Selection ]</h2>
+                <div class="client-grid">
+                    <button class="client-btn" onclick="generateProtocolLink('vless')" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">VLESS</button>
+                    <button class="client-btn" onclick="generateProtocolLink('trojan')" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">TROJAN</button>
+                    <button class="client-btn" onclick="generateProtocolLink('shadowsocks')" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">SHADOWSOCKS</button>
+                    <button class="client-btn" onclick="generateProtocolLink('xhttp')" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">XHTTP</button>
+                    <button class="client-btn" onclick="generateProtocolLink('all')" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">ALL PROTOCOLS</button>
+                </div>
+                <div class=atob('c3Vic2NyaXB0aW9uLXVybA==') id="protocolSubscriptionUrl" style="margin-top: 15px;"></div>
             </div>
             <div class="card">
                     <h2 class="card-title">${t.systemStatus}</h2>
@@ -3313,6 +3355,50 @@
                     }
                 });
             
+            function generateProtocolLink(protocol) {
+                var currentUrl = window.location.href;
+                var baseUrl = currentUrl + "/sub";
+                var finalUrl = '';
+                var displayText = '';
+                
+                // Clear previous client subscription URL
+                var clientUrlElement = document.getElementById("clientSubscriptionUrl");
+                if (clientUrlElement) {
+                    clientUrlElement.textContent = '';
+                    clientUrlElement.style.display = 'none';
+                }
+                
+                if (protocol === 'all') {
+                    finalUrl = baseUrl;
+                    displayText = 'All Protocols (全部协议)';
+                } else if (protocol === 'vless') {
+                    finalUrl = baseUrl + '?target=vless';
+                    displayText = 'VLESS Only';
+                } else if (protocol === 'trojan') {
+                    finalUrl = baseUrl + '?target=trojan';
+                    displayText = 'Trojan Only';
+                } else if (protocol === 'shadowsocks') {
+                    finalUrl = baseUrl + '?target=shadowsocks';
+                    displayText = 'Shadowsocks Only';
+                } else if (protocol === 'xhttp') {
+                    finalUrl = baseUrl + '?target=xhttp';
+                    displayText = 'xhttp Only';
+                }
+                
+                // Display the URL
+                var urlElement = document.getElementById("protocolSubscriptionUrl");
+                urlElement.innerHTML = '<div style="color: #00ff00; margin-bottom: 10px; font-weight: bold;">' + displayText + '</div>' +
+                                      '<div style="color: #00ff00; word-break: break-all; padding: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid #00ff00; border-radius: 5px;">' + finalUrl + '</div>';
+                urlElement.style.display = "block";
+                
+                // Copy to clipboard
+                navigator.clipboard.writeText(finalUrl).then(function() {
+                    alert('✅ ' + displayText + ' subscription link copied!\\n\\n订阅链接已复制！\\n\\n' + finalUrl);
+                }).catch(function(err) {
+                    console.error('Copy failed:', err);
+                });
+            }
+
             function tryOpenApp(schemeUrl, fallbackCallback, timeout) {
                 timeout = timeout || 2500;
                 var appOpened = false;
