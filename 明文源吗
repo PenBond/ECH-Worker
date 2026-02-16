@@ -2940,11 +2940,11 @@
             <div class="card">
                     <h2 class="card-title">[ 按协议选择 Protocol Selection ]</h2>
                 <div class="client-grid">
-                    <button class="client-btn" onclick="generateProtocolLink('vless')" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">VLESS</button>
-                    <button class="client-btn" onclick="generateProtocolLink('trojan')" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">TROJAN</button>
-                    <button class="client-btn" onclick="generateProtocolLink('shadowsocks')" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">SHADOWSOCKS</button>
-                    <button class="client-btn" onclick="generateProtocolLink('xhttp')" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">XHTTP</button>
-                    <button class="client-btn" onclick="generateProtocolLink('all')" style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);">ALL PROTOCOLS</button>
+                   <button class="client-btn" onclick="generateProtocolLink('vless')">VLESS</button>
+                   <button class="client-btn" onclick="generateProtocolLink('trojan')">TROJAN</button>
+                   <button class="client-btn" onclick="generateProtocolLink('shadowsocks')">SHADOWSOCKS</button>
+                   <button class="client-btn" onclick="generateProtocolLink('xhttp')">XHTTP</button>
+                   <button class="client-btn" onclick="generateProtocolLink('all')">ALL PROTOCOLS</button>
                 </div>
                 <div class=atob('c3Vic2NyaXB0aW9uLXVybA==') id="protocolSubscriptionUrl" style="margin-top: 15px;"></div>
             </div>
