@@ -22,8 +22,8 @@
     let tp = '';
     // 启用ECH功能（true启用，false禁用）
     let enableECH = false;  
-    // 自定义DNS服务器（默认：https://dns.joeyblog.eu.org/joeyblog）
-    let customDNS = 'https://dns.joeyblog.eu.org/joeyblog';
+    // 自定义DNS服务器（默认：https://cloudflare-dns.com/dns-query）
+    let customDNS = 'https://cloudflare-dns.com/dns-query';
     // 自定义ECH域名（默认：cloudflare-ech.com）
     let customECHDomain = 'cloudflare-ech.com';
 
@@ -2172,7 +2172,7 @@
 
     async function forwardUDP(udpChunk, webSocket, respHeader) {
         try {
-            const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
+            const tcpSocket = connect({ hostname: '1.1.1.1', port: 53 });
             let header = respHeader;
             const writer = tcpSocket.writable.getWriter();
             await writer.write(udpChunk);
