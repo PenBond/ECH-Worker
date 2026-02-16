@@ -18,7 +18,12 @@
 
     let ev = true;   
     let et = false; 
-    let ex = false;  
+    let ex = false;
+    let es = false;  // Enable Shadowsocks (configurable via KV/API)
+    let ssMethod = 'none';  // Shadowsocks encryption method
+    let ssPassword = at;  // Use same UUID as VLESS/Trojan
+    let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
+    
     let tp = '';
     // 启用ECH功能（true启用，false禁用）
     let enableECH = false;  
@@ -99,6 +104,20 @@
     const ADDRESS_TYPE_IPV4 = 1;
     const ADDRESS_TYPE_URL = 2;
     const ADDRESS_TYPE_IPV6 = 3;
+
+    function safeBase64Encode(str) {
+        try {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(str);
+            let binary = '';
+            for (let i = 0; i < data.length; i++) {
+                binary += String.fromCharCode(data[i]);
+            }
+            return btoa(binary);
+        } catch (e) {
+            return btoa(unescape(encodeURIComponent(str)));
+        }
+    }
 
     function isValidFormat(str) {
         const userRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -281,6 +300,43 @@
         return sortedIPs;
     }
 
+    function parseSSPacketHeader(chunk) {
+        if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
+        try {
+            const view = new Uint8Array(chunk);
+            const addressType = view[0];
+            let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
+            switch (addressType) {
+                case 1:
+                    addrLen = 4;
+                    hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.');
+                    addrValIdx += addrLen;
+                    break;
+                case 3:
+                    addrLen = view[addrIdx];
+                    addrValIdx += 1;
+                    hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen));
+                    addrValIdx += addrLen;
+                    break;
+                case 4:
+                    addrLen = 16;
+                    const ipv6 = [];
+                    const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen));
+                    for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
+                    hostname = ipv6.join(':');
+                    addrValIdx += addrLen;
+                    break;
+                default:
+                    return { hasError: true, message: `Invalid address type: ${addressType}` };
+            }
+            if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+            const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
+            return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
+        } catch (e) {
+            return { hasError: true, message: 'Failed to parse SS packet header' };
+        }
+    }
+
     function parseAddressAndPort(input) {
         if (input.includes('[') && input.includes(']')) {
             const match = input.match(/^\[([^\]]+)\](?::(\d+))?$/);
@@ -314,6 +370,10 @@
                 
                 at = (env.u || env.U || at).toLowerCase();
                 const subPath = (env.d || env.D || at).toLowerCase();
+                
+                // Update SS configuration immediately after loading UUID from env
+                ssPassword = at;  // Shadowsocks uses same UUID as VLESS/Trojan
+                ssPath = 'ss/' + at;  // Path becomes /ss/UUID
                 
                 const ci = getConfigValue('p', env.p || env.P);
                 let useCustomIP = false;
@@ -1559,6 +1619,18 @@
         const workerDomain = url.hostname;
         const target = url.searchParams.get('target') || 'base64';
 
+        // Read protocol selection from URL parameters (overrides global config)
+        const evParam = url.searchParams.get('ev');
+        const etParam = url.searchParams.get('et');
+        const esParam = url.searchParams.get('es');
+        const exParam = url.searchParams.get('ex');
+        
+        // Use URL params if provided, otherwise use global config
+        const useVLESS = evParam !== null ? (evParam === 'true' || evParam === '1' || evParam === 'yes') : ev;
+        const useTrojan = etParam !== null ? (etParam === 'true' || etParam === '1' || etParam === 'yes') : et;
+        const useShadowsocks = esParam !== null ? (esParam === 'true' || esParam === '1' || esParam === 'yes') : es;
+        const useXhttp = exParam !== null ? (exParam === 'true' || exParam === '1' || exParam === 'yes') : ex;
+
         // 如果启用了ECH，使用自定义值
         let echConfig = null;
         if (enableECH) {
@@ -1568,13 +1640,16 @@
         }
 
         async function addNodesFromList(list) {
-            if (ev) {
+            if (useVLESS) {
                 finalLinks.push(...generateLinksFromSource(list, user, workerDomain, echConfig));
             }
-            if (et) {
+            if (useTrojan) {
                 finalLinks.push(...await generateTrojanLinksFromSource(list, user, workerDomain, echConfig));
             }
-            if (ex) {
+            if (useShadowsocks) {
+                finalLinks.push(...generateSSLinksFromSource(list, workerDomain, ssPassword));
+            }
+            if (useXhttp) {
                 finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain, echConfig));
             }
         }
@@ -1896,6 +1971,23 @@
         return links;
     }
 
+    function generateSSLinksFromSource(list, workerDomain, password) {
+        const links = [];
+        list.forEach(item => {
+            let host = item.ip || item.domain || item.host;
+            let port = item.port || 443;
+            let nodeName = item.isp || item.name || item.colo || host;
+
+            const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
+            const wsPath = `/${password}/?ed=2560`;
+
+            const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=http/1.1;mux=0`;
+
+            links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
+        });
+        return links;
+    }
+
     async function fetchDynamicIPs() {
         const v4Url1 = "https://www.wetest.vip/page/cloudflare/address_v4.html";
         const v6Url1 = "https://www.wetest.vip/page/cloudflare/address_v6.html";
@@ -2034,6 +2126,27 @@
                             protocolType = atob('dHJvamFu');
                             const { addressType, port, hostname, rawClientData } = tjResult;
                             await forwardTCP(addressType, hostname, port, rawClientData, serverSock, null, remoteConnWrapper);
+                            return;
+                        }
+                    }
+                    
+                    // Try Shadowsocks
+                    if (es && chunk.byteLength >= 7) {
+                        const ssResult = parseSSPacketHeader(chunk);
+                        if (!ssResult.hasError) {
+                            protocolType = 'shadowsocks';
+                            const { addressType, port, hostname, rawIndex } = ssResult;
+                            
+                            if (addressType === 2) {
+                                if (port === 53) isDnsQuery = true;
+                                else throw new Error('UDP only supported for DNS');
+                            }
+                            
+                            const rawData = chunk.slice(rawIndex);
+                            if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
+                            
+                            // Use the same forwardTCP pattern as VLESS/Trojan for consistency
+                            await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper);
                             return;
                         }
                     }
@@ -2295,6 +2408,7 @@
                     enableVLESS: '启用 VLESS 协议',
                     enableTrojan: '启用 Trojan 协议',
                     enableXhttp: '启用 xhttp 协议',
+                    enableShadowsocks: '启用 Shadowsocks 协议',
                     trojanPassword: 'Trojan 密码 (可选):',
                     customPath: '自定义路径 (d):',
                     customIP: '自定义ProxyIP (p):',
@@ -2434,6 +2548,7 @@
                     enableVLESS: 'فعال‌سازی پروتکل VLESS',
                     enableTrojan: 'فعال‌سازی پروتکل Trojan',
                     enableXhttp: 'فعال‌سازی پروتکل xhttp',
+                    enableShadowsocks: 'فعال‌سازی پروتکل Shadowsocks',
                     enableECH: 'فعال‌سازی ECH (Encrypted Client Hello)',
                     enableECHHint: 'پس از فعال‌سازی، در هر بار تازه‌سازی اشتراک، پیکربندی ECH به‌روز به‌طور خودکار از DoH دریافت شده و به لینک‌ها اضافه می‌شود',
                     customDNS: 'سرور DNS سفارشی',
@@ -2849,6 +2964,12 @@
                                     <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
                                         <input type="checkbox" id="ex" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
                                             <span style="font-size: 1.1rem;">${t.enableXhttp}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
+                                        <input type="checkbox" id="es" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${t.enableShadowsocks}</span>
                                     </label>
                                 </div>
                                 <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(0, 255, 0, 0.3);">
@@ -3831,6 +3952,7 @@
                     document.getElementById('ev').checked = config.ev !== 'no';
                     document.getElementById('et').checked = config.et === 'yes';
                     document.getElementById('ex').checked = config.ex === 'yes';
+                    document.getElementById('es').checked = config.es === 'yes';
                     document.getElementById('ech').checked = config.ech === 'yes';
                     document.getElementById('tp').value = config.tp || '';
                     if (document.getElementById('customDNS')) {
@@ -4123,7 +4245,8 @@
                         const configData = { 
                             ev: document.getElementById('ev').checked ? 'yes' : 'no', 
                             et: document.getElementById('et').checked ? 'yes' : 'no', 
-                            ex: document.getElementById('ex').checked ? 'yes' : 'no', 
+                            ex: document.getElementById('ex').checked ? 'yes' : 'no',
+                            es: document.getElementById('es').checked ? 'yes' : 'no',
                             ech: document.getElementById('ech').checked ? 'yes' : 'no',
                             tp: document.getElementById('tp').value,
                             customDNS: document.getElementById('customDNS').value,
@@ -4132,7 +4255,8 @@
                         
                         if (!document.getElementById('ev').checked && 
                             !document.getElementById('et').checked && 
-                            !document.getElementById('ex').checked) {
+                            !document.getElementById('ex').checked &&
+                            !document.getElementById('es').checked) {
                             alert('至少需要启用一个协议！');
                             return;
                         }
