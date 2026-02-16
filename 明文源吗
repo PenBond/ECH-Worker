@@ -1,4 +1,4 @@
-    // CFnew - 终端 v2.9.3
+// CFnew - 终端 v2.9.3
     // 版本: v2.9.3
     import { connect } from 'cloudflare:sockets';
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
@@ -1580,12 +1580,10 @@
         }
 
         if (currentWorkerRegion === 'CUSTOM') {
-            const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-            await addNodesFromList(nativeList);
+            // Removed 原生地址 (native address) generation
         } else {
             try {
-                const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-                await addNodesFromList(nativeList);
+                // Removed 原生地址 (native address) generation
             } catch (error) {
                 if (!currentWorkerRegion) {
                     currentWorkerRegion = await detectWorkerRegion(request);
@@ -1597,8 +1595,7 @@
                     const backupList = [{ ip: bestBackupIP.domain, isp: 'ProxyIP-' + currentWorkerRegion }];
                     await addNodesFromList(backupList);
                 } else {
-                    const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-                    await addNodesFromList(nativeList);
+                    // Removed 原生地址 (native address) generation
                 }
             }
         }
@@ -1782,7 +1779,7 @@
             portsToGenerate.forEach(({ port, tls }) => {
                 if (tls) {
                     
-                    const wsNodeName = `${nodeNameBase}-${port}-WS-TLS`;
+                    const wsNodeName = `${nodeNameBase}`;
                     const wsParams = new URLSearchParams({ 
                         encryption: 'none', 
                         security: 'tls', 
@@ -1804,7 +1801,7 @@
                     links.push(`${proto}://${user}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
                 } else {
                     
-                    const wsNodeName = `${nodeNameBase}-${port}-WS`;
+                    const wsNodeName = `${nodeNameBase}`;
                     const wsParams = new URLSearchParams({
                         encryption: 'none',
                         security: 'none',
@@ -1864,7 +1861,7 @@
             portsToGenerate.forEach(({ port, tls }) => {
                 if (tls) {
                     
-                    const wsNodeName = `${nodeNameBase}-${port}-${atob('VHJvamFu')}-WS-TLS`;
+                    const wsNodeName = `${nodeNameBase}`;
                     const wsParams = new URLSearchParams({ 
                         security: 'tls', 
                         sni: workerDomain, 
@@ -1885,7 +1882,7 @@
                     links.push(`${atob('dHJvamFuOi8v')}${password}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
                 } else {
                     
-                    const wsNodeName = `${nodeNameBase}-${port}-${atob('VHJvamFu')}-WS`;
+                    const wsNodeName = `${nodeNameBase}`;
                     const wsParams = new URLSearchParams({
                         security: 'none',
                         type: 'ws',
@@ -2379,7 +2376,7 @@
                     tlsControlHint: '设置为"仅TLS节点"时只生成带TLS的节点，不生成非TLS节点（如80端口）',
                     preferredControlDefault: '默认（启用优选）',
                     preferredControlYes: '关闭优选',
-                    preferredControlHint: '设置为"关闭优选"时只使用原生地址，不生成优选IP和域名节点',
+                    preferredControlHint: '设置为"关闭优选"时不生成优选IP和域名节点',
                     regionNames: {
                         US: '🇺🇸 美国', SG: '🇸🇬 新加坡', JP: '🇯🇵 日本',
                         KR: '🇰🇷 韩国', DE: '🇩🇪 德国', SE: '🇸🇪 瑞典', NL: '🇳🇱 荷兰',
@@ -2518,7 +2515,7 @@
                     tlsControlHint: 'وقتی "فقط گره‌های TLS" تنظیم شود، فقط گره‌های با TLS تولید می‌شوند، گره‌های غیر TLS (مانند پورت 80) تولید نمی‌شوند',
                     preferredControlDefault: 'پیش‌فرض (فعال‌سازی ترجیح)',
                     preferredControlYes: 'بستن ترجیح',
-                    preferredControlHint: 'وقتی "بستن ترجیح" تنظیم شود، فقط از آدرس اصلی استفاده می‌شود، گره‌های IP و دامنه ترجیحی تولید نمی‌شوند',
+                    preferredControlHint: 'وقتی "بستن ترجیح" تنظیم شود، گره‌های IP و دامنه ترجیحی تولید نمی‌شوند',
                     regionNames: {
                         US: '🇺🇸 آمریکا', SG: '🇸🇬 سنگاپور', JP: '🇯🇵 ژاپن',
                         KR: '🇰🇷 کره جنوبی', DE: '🇩🇪 آلمان', SE: '🇸🇪 سوئد', NL: '🇳🇱 هلند',
@@ -5601,7 +5598,7 @@
             
             if (CF_HTTPS_PORTS.includes(port)) {
                 
-                const wsNodeName = `${nodeName}-${port}-WS-TLS`;
+                const wsNodeName = `${nodeName}`;
                 let link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
                 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
@@ -5616,13 +5613,13 @@
             } else if (CF_HTTP_PORTS.includes(port)) {
                 
                 if (!disableNonTLS) {
-                    const wsNodeName = `${nodeName}-${port}-WS`;
+                    const wsNodeName = `${nodeName}`;
                     const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
                     links.push(link);
                 }
             } else {
                 
-                const wsNodeName = `${nodeName}-${port}-WS-TLS`;
+                const wsNodeName = `${nodeName}`;
                 let link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
                 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
@@ -5651,7 +5648,7 @@
             const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
             const port = item.port || 443;
             
-            const wsNodeName = `${nodeNameBase}-${port}-xhttp`;
+            const wsNodeName = `${nodeNameBase}`;
             const params = new URLSearchParams({
                 encryption: 'none',
                 security: 'tls',
@@ -5693,7 +5690,7 @@
             
             if (CF_HTTPS_PORTS.includes(port)) {
                 
-                const wsNodeName = `${nodeName}-${port}-${atob('VHJvamFu')}-WS-TLS`;
+                const wsNodeName = `${nodeName}`;
                 let link = `${atob('dHJvamFuOi8v')}${password}@${item.ip}:${port}?security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}`;
                 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
@@ -5708,13 +5705,13 @@
             } else if (CF_HTTP_PORTS.includes(port)) {
                 
                 if (!disableNonTLS) {
-                    const wsNodeName = `${nodeName}-${port}-${atob('VHJvamFu')}-WS`;
+                    const wsNodeName = `${nodeName}`;
                     const link = `${atob('dHJvamFuOi8v')}${password}@${item.ip}:${port}?security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
                     links.push(link);
                 }
             } else {
                 
-                const wsNodeName = `${nodeName}-${port}-${atob('VHJvamFu')}-WS-TLS`;
+                const wsNodeName = `${nodeName}`;
                 let link = `${atob('dHJvamFuOi8v')}${password}@${item.ip}:${port}?security=tls&sni=${workerDomain}&fp=chrome&type=ws&host=${workerDomain}&path=${wsPath}`;
                 
                 // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
