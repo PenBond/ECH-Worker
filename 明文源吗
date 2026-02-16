@@ -17,9 +17,9 @@
     let cp = '';  
 
     let ev = true;   
-    let et = false; 
-    let ex = false;
-    let es = false;  // Enable Shadowsocks (configurable via KV/API)
+    let et = true; 
+    let ex = true;
+    let es = true;  // Enable Shadowsocks (configurable via KV/API)
     let ssMethod = 'none';  // Shadowsocks encryption method
     let ssPassword = at;  // Use same UUID as VLESS/Trojan
     let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
