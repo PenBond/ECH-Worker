@@ -1,11 +1,14 @@
 // CFnew - 终端 v8.9.1
+// Changes By Dr.Upendra
     // 版本: v8.9.1
     import { connect } from 'cloudflare:sockets';
+
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
     let socks5Config = '';
     let customPreferredIPs = [];
     let customPreferredDomains = [];
+
     let enableSocksDowngrade = false;
     let disableNonTLS = false;
     let disablePreferred = false;
@@ -20,6 +23,7 @@
     let et = true; 
     let ex = true;
     let es = true; 
+
     let ssMethod = 'none';  // Shadowsocks encryption method
     let ssPassword = at;  // Use same UUID as VLESS/Trojan
     let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
@@ -416,21 +420,19 @@
                 const esConfig = getConfigValue('es', '');
                 
                 // Update global protocol flags from KV config
-                if (evConfig === 'no') ev = false;
-                else if (evConfig === 'yes') ev = true;
-                // else keep default value from code
-                
-                if (etConfig === 'yes') et = true;
-                else if (etConfig === 'no') et = false;
-                // else keep default value from code
-                
-                if (exConfig === 'yes') ex = true;
-                else if (exConfig === 'no') ex = false;
-                // else keep default value from code
-                
-                if (esConfig === 'yes') es = true;
-                else if (esConfig === 'no') es = false;
-                // else keep default value from code
+                // If KV has a value (yes/no), use it. Otherwise keep code default.
+                if (evConfig) {
+                    ev = (evConfig === 'yes');
+                }
+                if (etConfig) {
+                    et = (etConfig === 'yes');
+                }
+                if (exConfig) {
+                    ex = (exConfig === 'yes');
+                }
+                if (esConfig) {
+                    es = (esConfig === 'yes');
+                }
 
                 const customPreferred = getConfigValue('yx', env.yx || env.YX);
                 if (customPreferred) {
