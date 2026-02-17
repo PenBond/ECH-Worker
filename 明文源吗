@@ -17,9 +17,9 @@
     let cp = '';  
 
     let ev = true;   
-    let et = true; 
-    let ex = true;
-    let es = true;  // Enable Shadowsocks (configurable via KV/API)
+    let et = false; 
+    let ex = false;
+    let es = false;  // Enable Shadowsocks (configurable via KV/API)
     let ssMethod = 'none';  // Shadowsocks encryption method
     let ssPassword = at;  // Use same UUID as VLESS/Trojan
     let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
@@ -408,6 +408,29 @@
                         isSocksEnabled = false;
                     }
                 }
+
+                // Load protocol settings from KV config
+                const evConfig = getConfigValue('ev', '');
+                const etConfig = getConfigValue('et', '');
+                const exConfig = getConfigValue('ex', '');
+                const esConfig = getConfigValue('es', '');
+                
+                // Update global protocol flags from KV config
+                if (evConfig === 'no') ev = false;
+                else if (evConfig === 'yes') ev = true;
+                // else keep default value from code
+                
+                if (etConfig === 'yes') et = true;
+                else if (etConfig === 'no') et = false;
+                // else keep default value from code
+                
+                if (exConfig === 'yes') ex = true;
+                else if (exConfig === 'no') ex = false;
+                // else keep default value from code
+                
+                if (esConfig === 'yes') es = true;
+                else if (esConfig === 'no') es = false;
+                // else keep default value from code
 
                 const customPreferred = getConfigValue('yx', env.yx || env.YX);
                 if (customPreferred) {
@@ -2938,17 +2961,6 @@
                 <div class=atob('c3Vic2NyaXB0aW9uLXVybA==') id="clientSubscriptionUrl"></div>
             </div>
             <div class="card">
-                    <h2 class="card-title">[ 按协议选择 Protocol Selection ]</h2>
-                <div class="client-grid">
-                   <button class="client-btn" onclick="generateProtocolLink('vless')">VLESS</button>
-                   <button class="client-btn" onclick="generateProtocolLink('trojan')">TROJAN</button>
-                   <button class="client-btn" onclick="generateProtocolLink('shadowsocks')">SHADOWSOCKS</button>
-                   <button class="client-btn" onclick="generateProtocolLink('xhttp')">XHTTP</button>
-                   <button class="client-btn" onclick="generateProtocolLink('all')">ALL PROTOCOLS</button>
-                </div>
-                <div class=atob('c3Vic2NyaXB0aW9uLXVybA==') id="protocolSubscriptionUrl" style="margin-top: 15px;"></div>
-            </div>
-            <div class="card">
                     <h2 class="card-title">${t.systemStatus}</h2>
                 <div id="systemStatus" style="margin: 20px 0; padding: 15px; background: rgba(0, 20, 0, 0.8); border: 2px solid #00ff00; box-shadow: 0 0 20px rgba(0, 255, 0, 0.3), inset 0 0 15px rgba(0, 255, 0, 0.1); position: relative; overflow: hidden;">
                         <div style="color: #00ff00; margin-bottom: 15px; font-weight: bold; text-shadow: 0 0 5px #00ff00;">[ ${t.checking} ]</div>
@@ -3355,50 +3367,6 @@
                     }
                 });
             
-            function generateProtocolLink(protocol) {
-                var currentUrl = window.location.href;
-                var baseUrl = currentUrl + "/sub";
-                var finalUrl = '';
-                var displayText = '';
-                
-                // Clear previous client subscription URL
-                var clientUrlElement = document.getElementById("clientSubscriptionUrl");
-                if (clientUrlElement) {
-                    clientUrlElement.textContent = '';
-                    clientUrlElement.style.display = 'none';
-                }
-                
-                if (protocol === 'all') {
-                    finalUrl = baseUrl;
-                    displayText = 'All Protocols (全部协议)';
-                } else if (protocol === 'vless') {
-                    finalUrl = baseUrl + '?target=vless';
-                    displayText = 'VLESS Only';
-                } else if (protocol === 'trojan') {
-                    finalUrl = baseUrl + '?target=trojan';
-                    displayText = 'Trojan Only';
-                } else if (protocol === 'shadowsocks') {
-                    finalUrl = baseUrl + '?target=shadowsocks';
-                    displayText = 'Shadowsocks Only';
-                } else if (protocol === 'xhttp') {
-                    finalUrl = baseUrl + '?target=xhttp';
-                    displayText = 'xhttp Only';
-                }
-                
-                // Display the URL
-                var urlElement = document.getElementById("protocolSubscriptionUrl");
-                urlElement.innerHTML = '<div style="color: #00ff00; margin-bottom: 10px; font-weight: bold;">' + displayText + '</div>' +
-                                      '<div style="color: #00ff00; word-break: break-all; padding: 10px; background: rgba(0, 0, 0, 0.5); border: 1px solid #00ff00; border-radius: 5px;">' + finalUrl + '</div>';
-                urlElement.style.display = "block";
-                
-                // Copy to clipboard
-                navigator.clipboard.writeText(finalUrl).then(function() {
-                    alert('✅ ' + displayText + ' subscription link copied!\\n\\n订阅链接已复制！\\n\\n' + finalUrl);
-                }).catch(function(err) {
-                    console.error('Copy failed:', err);
-                });
-            }
-
             function tryOpenApp(schemeUrl, fallbackCallback, timeout) {
                 timeout = timeout || 2500;
                 var appOpened = false;
