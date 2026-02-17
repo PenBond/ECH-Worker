@@ -3419,6 +3419,23 @@
                 var subscriptionUrl = currentUrl + "/sub";
                 var schemeUrl = '';
                 var displayName = clientName || '';
+                
+                // Read current checkbox states and add as URL parameters
+                var evChecked = document.getElementById('ev') && document.getElementById('ev').checked;
+                var etChecked = document.getElementById('et') && document.getElementById('et').checked;
+                var exChecked = document.getElementById('ex') && document.getElementById('ex').checked;
+                var esChecked = document.getElementById('es') && document.getElementById('es').checked;
+                
+                // Build protocol parameters
+                var protocolParams = [];
+                protocolParams.push('ev=' + (evChecked ? 'yes' : 'no'));
+                protocolParams.push('et=' + (etChecked ? 'yes' : 'no'));
+                protocolParams.push('ex=' + (exChecked ? 'yes' : 'no'));
+                protocolParams.push('es=' + (esChecked ? 'yes' : 'no'));
+                
+                // Add protocol params to subscription URL
+                subscriptionUrl = subscriptionUrl + '?' + protocolParams.join('&');
+                
                 var finalUrl = subscriptionUrl;
                 
                 if (clientType === atob('djJyYXk=')) {
@@ -3464,7 +3481,7 @@
                     
                     // 如果 ECH 开启且是 Clash，直接使用后端接口
                     if (echEnabled && clientType === atob('Y2xhc2g=')) {
-                        finalUrl = subscriptionUrl + "?target=" + clientType;
+                        finalUrl = subscriptionUrl + "&target=" + clientType;
                         var urlElement = document.getElementById("clientSubscriptionUrl");
                         urlElement.textContent = finalUrl;
                         urlElement.style.display = "block";
