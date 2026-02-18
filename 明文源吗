@@ -21,11 +21,12 @@
 
     let ev = true;   
     let et = true; 
+    let ex = true;
     let es = true; 
 
-    let ssMethod = 'none';  // Shadowsocks encryption method
-    let ssPassword = at;  // Use same UUID as VLESS/Trojan
-    let ssPath = 'ss/' + at;  // Prefix to distinguish paths (e.g., /ss/uuid/?ed=2560)
+    let socksUser = at;   // SOCKS5 username (same UUID as VLESS/Trojan)
+    let socksPass = at;   // SOCKS5 password (same UUID as VLESS/Trojan)
+    let socksWsPath = 'socks/' + at;  // WebSocket path prefix for SOCKS5 nodes
     
     let tp = '';
     // 启用ECH功能（true启用，false禁用）
@@ -303,41 +304,87 @@
         return sortedIPs;
     }
 
-    function parseSSPacketHeader(chunk) {
-        if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
-        try {
-            const view = new Uint8Array(chunk);
-            const addressType = view[0];
-            let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
-            switch (addressType) {
-                case 1:
+    // Parse SOCKS5 handshake over WebSocket.
+    // Expected flow (client sends in first chunk or across chunks):
+    //   1. Version negotiation: \x05 <nmethods> <methods...>  → reply \x05\x00
+    //   2. CONNECT request:     \x05\x01\x00 <atyp> <addr> <port>
+    // For simplicity we accept both phases if bundled, or handle them across writes.
+    // We return a stateful parser object so handleWsRequest can track phase.
+    function createSocks5Parser(uuid) {
+        return {
+            phase: 0,           // 0=await greeting, 1=await request
+            result: null,
+            // Feed a chunk; returns { done, hasError, message, addressType, hostname, port, rawIndex }
+            feed(chunk) {
+                const view = new Uint8Array(chunk);
+                if (this.phase === 0) {
+                    // Greeting: \x05 <nmethods> [methods]
+                    if (view[0] !== 0x05) return { done: false, hasError: true, message: 'Not SOCKS5' };
+                    if (chunk.byteLength < 2) return { done: false, hasError: true, message: 'Too short' };
+                    const nmethods = view[1];
+                    // Check for username/password auth (0x02) or no-auth (0x00)
+                    let methods = [];
+                    for (let i = 0; i < nmethods && i + 2 < chunk.byteLength; i++) methods.push(view[2 + i]);
+                    const useUserPassAuth = methods.includes(0x02);
+                    const useNoAuth = methods.includes(0x00);
+                    const greetingEnd = 2 + nmethods;
+                    // Check if the CONNECT request is also bundled in this chunk
+                    let requestStart = greetingEnd;
+                    if (useUserPassAuth && chunk.byteLength > greetingEnd) {
+                        // Sub-negotiation: \x01 <ulen> <user> <plen> <pass>
+                        const sub = view[greetingEnd];
+                        if (sub === 0x01 && chunk.byteLength > greetingEnd + 1) {
+                            const ulen = view[greetingEnd + 1];
+                            const plen = view[greetingEnd + 2 + ulen] || 0;
+                            requestStart = greetingEnd + 3 + ulen + plen;
+                        }
+                    }
+                    // If CONNECT request is bundled
+                    if (chunk.byteLength > requestStart && view[requestStart] === 0x05) {
+                        return this._parseRequest(chunk.slice(requestStart));
+                    }
+                    // Need more data (request not bundled)
+                    this.phase = 1;
+                    this.authMethod = useUserPassAuth ? 0x02 : 0x00;
+                    return { done: false, hasError: false };
+                } else {
+                    return this._parseRequest(chunk);
+                }
+            },
+            _parseRequest(buf) {
+                const v = new Uint8Array(buf);
+                if (buf.byteLength < 7) return { done: false, hasError: true, message: 'Request too short' };
+                if (v[0] !== 0x05) return { done: false, hasError: true, message: 'Bad SOCKS5 version in request' };
+                if (v[1] !== 0x01) return { done: false, hasError: true, message: 'Only CONNECT supported' };
+                // v[2] = reserved
+                const atyp = v[3];
+                let hostname = '', addrLen = 0, addrStart = 4;
+                if (atyp === 0x01) {
+                    // IPv4
                     addrLen = 4;
-                    hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.');
-                    addrValIdx += addrLen;
-                    break;
-                case 3:
-                    addrLen = view[addrIdx];
-                    addrValIdx += 1;
-                    hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen));
-                    addrValIdx += addrLen;
-                    break;
-                case 4:
+                    hostname = Array.from(new Uint8Array(buf.slice(addrStart, addrStart + addrLen))).join('.');
+                } else if (atyp === 0x03) {
+                    // Domain
+                    addrLen = v[4];
+                    addrStart = 5;
+                    hostname = new TextDecoder().decode(buf.slice(addrStart, addrStart + addrLen));
+                } else if (atyp === 0x06) {
+                    // IPv6
                     addrLen = 16;
-                    const ipv6 = [];
-                    const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen));
-                    for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
-                    hostname = ipv6.join(':');
-                    addrValIdx += addrLen;
-                    break;
-                default:
-                    return { hasError: true, message: `Invalid address type: ${addressType}` };
+                    const dv = new DataView(buf.slice(addrStart, addrStart + addrLen));
+                    const segs = [];
+                    for (let i = 0; i < 8; i++) segs.push(dv.getUint16(i * 2).toString(16));
+                    hostname = segs.join(':');
+                } else {
+                    return { done: false, hasError: true, message: `Unknown atyp: ${atyp}` };
+                }
+                const portStart = addrStart + addrLen;
+                const port = new DataView(buf.slice(portStart, portStart + 2)).getUint16(0);
+                // Map atyp to internal address type constants
+                const addressType = atyp === 0x01 ? ADDRESS_TYPE_IPV4 : (atyp === 0x03 ? ADDRESS_TYPE_URL : ADDRESS_TYPE_IPV6);
+                return { done: true, hasError: false, addressType, hostname, port, rawIndex: portStart + 2 };
             }
-            if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
-            const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
-            return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
-        } catch (e) {
-            return { hasError: true, message: 'Failed to parse SS packet header' };
-        }
+        };
     }
 
     function parseAddressAndPort(input) {
@@ -374,9 +421,10 @@
                 at = (env.u || env.U || at).toLowerCase();
                 const subPath = (env.d || env.D || at).toLowerCase();
                 
-                // Update SS configuration immediately after loading UUID from env
-                ssPassword = at;  // Shadowsocks uses same UUID as VLESS/Trojan
-                ssPath = 'ss/' + at;  // Path becomes /ss/UUID
+                // Update SOCKS5 configuration immediately after loading UUID from env
+                socksUser = at;  // SOCKS5 uses same UUID as VLESS/Trojan
+                socksPass = at;
+                socksWsPath = 'socks/' + at;  // Path becomes /socks/UUID
                 
                 const ci = getConfigValue('p', env.p || env.P);
                 let useCustomIP = false;
@@ -415,6 +463,7 @@
                 // Load protocol settings from KV config
                 const evConfig = getConfigValue('ev', '');
                 const etConfig = getConfigValue('et', '');
+                const exConfig = getConfigValue('ex', '');
                 const esConfig = getConfigValue('es', '');
                 
                 // Update global protocol flags from KV config
@@ -424,6 +473,9 @@
                 }
                 if (etConfig) {
                     et = (etConfig === 'yes');
+                }
+                if (exConfig) {
+                    ex = (exConfig === 'yes');
                 }
                 if (esConfig) {
                     es = (esConfig === 'yes');
@@ -499,6 +551,11 @@
             }
                 
                 tp = getConfigValue('tp', env.tp) || '';
+                
+                const xhttpControl = getConfigValue('ex', env.ex);
+                if (xhttpControl !== undefined && xhttpControl !== '') {
+                    ex = xhttpControl === 'yes' || xhttpControl === true || xhttpControl === 'true';
+                }
                 
                 scu = getConfigValue('scu', env.scu) || 'https://url.v1.mk/sub';
                 
@@ -628,6 +685,23 @@
                         headers: { 'Content-Type': 'application/json' }
                     });
                 }
+            
+            if (request.method === 'POST' && ex) {
+                const r = await handleXhttpPost(request);
+                if (r) {
+                    ctx.waitUntil(r.closed);
+                    return new Response(r.readable, {
+                        headers: {
+                            'X-Accel-Buffering': 'no',
+                            'Cache-Control': 'no-store',
+                            Connection: 'keep-alive',
+                            'User-Agent': 'Go-http-client/2.0',
+                            'Content-Type': 'application/grpc',
+                        },
+                    });
+                }
+                return new Response('Internal Server Error', { status: 500 });
+            }
 
             if (request.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
                 return await handleWsRequest(request);
@@ -1621,9 +1695,10 @@
         const evParam = url.searchParams.get('ev');
         const etParam = url.searchParams.get('et');
         const esParam = url.searchParams.get('es');
+        const exParam = url.searchParams.get('ex');
         
         // Smart protocol filtering based on target
-        let useVLESS, useTrojan, useShadowsocks;
+        let useVLESS, useTrojan, useShadowsocks, useXhttp;
         
         // If target specifies a specific protocol, only use that protocol
         const lowerTarget = target.toLowerCase();
@@ -1632,21 +1707,31 @@
             useVLESS = false;
             useTrojan = true;
             useShadowsocks = false;
-        } else if (lowerTarget === 'ss' || lowerTarget === 'shadowsocks') {
-            // Only Shadowsocks protocol
+            useXhttp = false;
+        } else if (lowerTarget === 'ss' || lowerTarget === 'shadowsocks' || lowerTarget === 'socks5' || lowerTarget === 'socks') {
+            // Only SOCKS5 protocol
             useVLESS = false;
             useTrojan = false;
             useShadowsocks = true;
+            useXhttp = false;
         } else if (lowerTarget === 'vless') {
             // Only VLESS protocol
             useVLESS = true;
             useTrojan = false;
             useShadowsocks = false;
+            useXhttp = false;
+        } else if (lowerTarget === 'xhttp') {
+            // Only xhttp protocol
+            useVLESS = false;
+            useTrojan = false;
+            useShadowsocks = false;
+            useXhttp = true;
         } else {
             // Default: Use URL params if provided, otherwise use global config
             useVLESS = evParam !== null ? (evParam === 'true' || evParam === '1' || evParam === 'yes') : ev;
             useTrojan = etParam !== null ? (etParam === 'true' || etParam === '1' || etParam === 'yes') : et;
             useShadowsocks = esParam !== null ? (esParam === 'true' || esParam === '1' || esParam === 'yes') : es;
+            useXhttp = exParam !== null ? (exParam === 'true' || exParam === '1' || exParam === 'yes') : ex;
         }
 
         // 如果启用了ECH，使用自定义值
@@ -1665,7 +1750,10 @@
                 finalLinks.push(...await generateTrojanLinksFromSource(list, user, workerDomain, echConfig));
             }
             if (useShadowsocks) {
-                finalLinks.push(...generateSSLinksFromSource(list, workerDomain, ssPassword));
+                finalLinks.push(...generateSocks5LinksFromSource(list, workerDomain, socksUser, socksPass));
+            }
+            if (useXhttp) {
+                finalLinks.push(...generateXhttpLinksFromSource(list, user, workerDomain, echConfig));
             }
         }
 
@@ -1986,19 +2074,21 @@
         return links;
     }
 
-    function generateSSLinksFromSource(list, workerDomain, password) {
+    function generateSocks5LinksFromSource(list, workerDomain, user, pass) {
         const links = [];
         list.forEach(item => {
             let host = item.ip || item.domain || item.host;
             let port = item.port || 443;
             let nodeName = item.isp || item.name || item.colo || host;
+            const safeHost = (host && host.includes(':')) ? `[${host}]` : host;
 
-            const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
-            const wsPath = `/${password}/?ed=2560`;
+            const wsPath = `/${socksWsPath}`;
+            // Use v2ray-plugin to carry SOCKS5 over WebSocket+TLS (same transport as VLESS/Trojan)
+            const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};tls-cert-skip-verify`;
 
-            const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};skip-cert-verify=true;alpn=http/1.1;mux=0`;
-
-            links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
+            // SIP002-style socks5 URI: socks5://base64url(user:pass)@host:port?plugin=...#name
+            const encodedUserInfo = safeBase64Encode(`${user}:${pass}`).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+            links.push(`socks5://${encodedUserInfo}@${safeHost}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
         });
         return links;
     }
@@ -2116,6 +2206,20 @@
                     return;
                 }
                 
+                // Handle SOCKS5 multi-chunk handshake (request phase)
+                if (protocolType === 'socks5_pending') {
+                    const parseResult = remoteConnWrapper._socks5Parser.feed(chunk);
+                    if (parseResult.done && !parseResult.hasError) {
+                        protocolType = 'socks5';
+                        const { addressType, hostname, port, rawIndex } = parseResult;
+                        const connReply = new Uint8Array([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                        serverSock.send(connReply.buffer);
+                        const rawData = chunk.slice(rawIndex);
+                        await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper);
+                    }
+                    return;
+                }
+                
                 if (!protocolType) {
                     
                     if (ev && chunk.byteLength >= 24) {
@@ -2145,24 +2249,34 @@
                         }
                     }
                     
-                    // Try Shadowsocks
-                    if (es && chunk.byteLength >= 7) {
-                        const ssResult = parseSSPacketHeader(chunk);
-                        if (!ssResult.hasError) {
-                            protocolType = 'shadowsocks';
-                            const { addressType, port, hostname, rawIndex } = ssResult;
-                            
-                            if (addressType === 2) {
-                                if (port === 53) isDnsQuery = true;
-                                else throw new Error('UDP only supported for DNS');
+                    // Try SOCKS5-over-WebSocket
+                    if (es && chunk.byteLength >= 3) {
+                        const view5 = new Uint8Array(chunk);
+                        if (view5[0] === 0x05) {
+                            // Looks like SOCKS5 greeting
+                            if (!remoteConnWrapper._socks5Parser) {
+                                remoteConnWrapper._socks5Parser = createSocks5Parser(at);
+                                // Send SOCKS5 greeting reply: \x05\x00 (no auth)
+                                const greetReply = new Uint8Array([0x05, 0x00]);
+                                serverSock.send(greetReply.buffer);
                             }
-                            
-                            const rawData = chunk.slice(rawIndex);
-                            if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
-                            
-                            // Use the same forwardTCP pattern as VLESS/Trojan for consistency
-                            await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper);
-                            return;
+                            const parseResult = remoteConnWrapper._socks5Parser.feed(chunk);
+                            if (parseResult.hasError) {
+                                // Not valid SOCKS5, fall through
+                            } else if (!parseResult.done) {
+                                // Need more data for SOCKS5 request phase
+                                protocolType = 'socks5_pending';
+                                return;
+                            } else {
+                                protocolType = 'socks5';
+                                const { addressType, hostname, port, rawIndex } = parseResult;
+                                // Send SOCKS5 CONNECT success reply: \x05\x00\x00\x01\x00\x00\x00\x00\x00\x00
+                                const connReply = new Uint8Array([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                                serverSock.send(connReply.buffer);
+                                const rawData = chunk.slice(rawIndex);
+                                await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper);
+                                return;
+                            }
                         }
                     }
                     
@@ -2422,7 +2536,8 @@
                     protocolSelection: '协议选择:',
                     enableVLESS: '启用 VLESS 协议',
                     enableTrojan: '启用 Trojan 协议',
-                    enableShadowsocks: '启用 Shadowsocks 协议',
+                    enableXhttp: '启用 xhttp 协议',
+                    enableShadowsocks: '启用 SOCKS5 协议',
                     trojanPassword: 'Trojan 密码 (可选):',
                     customPath: '自定义路径 (d):',
                     customIP: '自定义ProxyIP (p):',
@@ -2477,7 +2592,212 @@
                     autoSubscriptionCopied: '自动识别订阅链接已复制，客户端访问时会根据User-Agent自动识别并返回对应格式',
                     trojanPasswordPlaceholder: '留空则自动使用 UUID',
                     trojanPasswordHint: '设置自定义 Trojan 密码。留空则使用 UUID。客户端会自动对密码进行 SHA224 哈希。',
-                    protocolHint: '可以同时启用多个协议。订阅将生成选中协议的节点。<br>• VLESS WS: 基于 WebSocket 的标准协议<br>• Trojan: 使用 SHA224 密码认证<br><br>• VLESS WS: پروتکل استاندارد مبتنی بر WebSocket<br>• Trojan: احراز هویت با رمز عبور SHA224<br><!DOCTYPE html>
+                    protocolHint: '可以同时启用多个协议。订阅将生成选中协议的节点。<br>• VLESS WS: 基于 WebSocket 的标准协议<br>• Trojan: 使用 SHA224 密码认证<br>• xhttp: 基于 HTTP POST 的伪装协议（需要绑定自定义域名并开启 gRPC）<br>• SOCKS5: 基于 WebSocket 的 SOCKS5 代理协议',
+                    enableECH: '启用 ECH (Encrypted Client Hello)',
+                    enableECHHint: '启用后，每次刷新订阅时会自动从 DoH 获取最新的 ECH 配置并添加到链接中',
+                    customDNS: '自定义 DNS 服务器',
+                    customDNSPlaceholder: '例如: https://cloudflare-dns.com/dns-query',
+                    customDNSHint: '用于ECH配置查询的DNS服务器地址（DoH格式）',
+                    customECHDomain: '自定义 ECH 域名',
+                    customECHDomainPlaceholder: '例如: cloudflare-ech.com',
+                    customECHDomainHint: 'ECH配置中使用的域名，留空则使用默认值',
+                    saveProtocol: '保存协议配置',
+                    subscriptionConverterPlaceholder: '默认: https://url.v1.mk/sub',
+                    subscriptionConverterHint: '自定义订阅转换API地址，留空则使用默认地址',
+                    builtinPreferredHint: '控制订阅中包含哪些内置优选节点。默认全部启用。',
+                    apiEnabledDefault: '默认（关闭API）',
+                    apiEnabledYes: '开启API管理',
+                    apiEnabledHint: '⚠️ 安全提醒：开启后允许通过API动态添加优选IP。建议仅在需要时开启。',
+                    regionMatchingDefault: '默认（启用地区匹配）',
+                    regionMatchingNo: '关闭地区匹配',
+                    regionMatchingHint: '设置为"关闭"时不进行地区智能匹配',
+                    downgradeControlDefault: '默认（不启用降级）',
+                    downgradeControlNo: '启用降级模式',
+                    downgradeControlHint: '设置为"启用"时：CF直连失败→SOCKS5连接→fallback地址',
+                    tlsControlDefault: '默认（保留所有节点）',
+                    tlsControlYes: '仅TLS节点',
+                    tlsControlHint: '设置为"仅TLS节点"时只生成带TLS的节点，不生成非TLS节点（如80端口）',
+                    preferredControlDefault: '默认（启用优选）',
+                    preferredControlYes: '关闭优选',
+                    preferredControlHint: '设置为"关闭优选"时不生成优选IP和域名节点',
+                    regionNames: {
+                        US: '🇺🇸 美国', SG: '🇸🇬 新加坡', JP: '🇯🇵 日本',
+                        KR: '🇰🇷 韩国', DE: '🇩🇪 德国', SE: '🇸🇪 瑞典', NL: '🇳🇱 荷兰',
+                        FI: '🇫🇮 芬兰', GB: '🇬🇧 英国'
+                    },
+                    terminal: '终端 v8.9.1',
+                    githubProject: 'GitHub 项目',
+                    autoDetectClient: '自动识别',
+                selectionLogicText: '同地区 → 邻近地区 → 其他地区',
+                customIPDisabledHint: '使用自定义ProxyIP时，地区选择已禁用',
+                customIPMode: '自定义ProxyIP模式 (p变量启用)',
+                customIPModeDesc: '自定义IP模式 (已禁用地区匹配)',
+                usingCustomProxyIP: '使用自定义ProxyIP: ',
+                customIPConfig: ' (p变量配置)',
+                customIPModeDisabled: '自定义IP模式，地区选择已禁用',
+                manualRegion: '手动指定地区',
+                manualRegionDesc: ' (手动指定)',
+                proxyIPAvailable: '10/10 可用 (ProxyIP域名预设可用)',
+                smartSelection: '智能就近选择中',
+                sameRegionIP: '同地区IP可用 (1个)',
+                cloudflareDetection: 'Cloudflare内置检测',
+                detectionFailed: '检测失败',
+                apiTestResult: 'API检测结果: ',
+                apiTestTime: '检测时间: ',
+                apiTestFailed: 'API检测失败: ',
+                unknownError: '未知错误',
+                apiTestError: 'API测试失败: ',
+                kvNotConfigured: 'KV存储未配置，无法使用配置管理功能。\\n\\n请在Cloudflare Workers中:\\n1. 创建KV命名空间\\n2. 绑定环境变量 C\\n3. 重新部署代码',
+                kvNotEnabled: 'KV存储未配置',
+                kvCheckFailed: 'KV存储检测失败: 响应格式错误',
+                kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
+                kvCheckFailedError: 'KV存储检测失败 - 错误: '
+            },
+                fa: {
+                    title: 'مرکز اشتراک',
+                    subtitle: 'پشتیبانی چند کلاینت • انتخاب هوشمند • تولید یک کلیکی',
+                    selectClient: '[ انتخاب کلاینت ]',
+                    systemStatus: '[ وضعیت سیستم ]',
+                    configManagement: '[ مدیریت تنظیمات ]',
+                    relatedLinks: '[ لینک‌های مرتبط ]',
+                    checking: 'در حال بررسی...',
+                    workerRegion: 'منطقه Worker: ',
+                    detectionMethod: 'روش تشخیص: ',
+                    proxyIPStatus: 'وضعیت ProxyIP: ',
+                    currentIP: 'IP فعلی: ',
+                    regionMatch: 'تطبیق منطقه: ',
+                    selectionLogic: 'منطق انتخاب: ',
+                    kvStatusChecking: 'در حال بررسی وضعیت KV...',
+                    kvEnabled: '✅ ذخیره‌سازی KV فعال است، می‌توانید از مدیریت تنظیمات استفاده کنید',
+                    kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
+                    specifyRegion: 'تعیین منطقه (wk):',
+                    autoDetect: 'تشخیص خودکار',
+                    saveRegion: 'ذخیره تنظیمات منطقه',
+                    protocolSelection: 'انتخاب پروتکل:',
+                    enableVLESS: 'فعال‌سازی پروتکل VLESS',
+                    enableTrojan: 'فعال‌سازی پروتکل Trojan',
+                    enableXhttp: 'فعال‌سازی پروتکل xhttp',
+                    enableShadowsocks: 'فعال‌سازی پروتکل SOCKS5',
+                    enableECH: 'فعال‌سازی ECH (Encrypted Client Hello)',
+                    enableECHHint: 'پس از فعال‌سازی، در هر بار تازه‌سازی اشتراک، پیکربندی ECH به‌روز به‌طور خودکار از DoH دریافت شده و به لینک‌ها اضافه می‌شود',
+                    customDNS: 'سرور DNS سفارشی',
+                    customDNSPlaceholder: 'مثال: https://cloudflare-dns.com/dns-query',
+                    customDNSHint: 'آدرس سرور DNS برای جستجوی پیکربندی ECH (فرمت DoH)',
+                    customECHDomain: 'دامنه ECH سفارشی',
+                    customECHDomainPlaceholder: 'مثال: cloudflare-ech.com',
+                    customECHDomainHint: 'دامنه استفاده شده در پیکربندی ECH، خالی بگذارید تا از مقدار پیش‌فرض استفاده شود',
+                    trojanPassword: 'رمز عبور Trojan (اختیاری):',
+                    customPath: 'مسیر سفارشی (d):',
+                    customIP: 'ProxyIP سفارشی (p):',
+                    preferredIPs: 'لیست IP ترجیحی (yx):',
+                    preferredIPsURL: 'URL منبع IP ترجیحی (yxURL):',
+                    latencyTest: 'تست تاخیر',
+                    latencyTestIP: 'IP/دامنه تست:',
+                    latencyTestIPPlaceholder: 'IP یا دامنه وارد کنید، چند مورد با کاما جدا شوند',
+                    latencyTestPort: 'پورت:',
+                    startTest: 'شروع تست',
+                    stopTest: 'توقف تست',
+                    testResult: 'نتیجه تست:',
+                    addToYx: 'افزودن به لیست ترجیحی',
+                    addSelectedToYx: 'افزودن موارد انتخاب شده',
+                    selectAll: 'انتخاب همه',
+                    deselectAll: 'لغو انتخاب',
+                    testingInProgress: 'در حال تست...',
+                    testComplete: 'تست کامل شد',
+                    latencyMs: 'تاخیر',
+                    timeout: 'زمان تمام شد',
+                    ipSource: 'منبع IP:',
+                    manualInput: 'ورودی دستی',
+                    cfRandomIP: 'IP تصادفی CF',
+                    urlFetch: 'دریافت از URL',
+                    randomCount: 'تعداد تولید:',
+                    fetchURL: 'URL دریافت:',
+                    fetchURLPlaceholder: 'آدرس URL لیست IP را وارد کنید',
+                    generateIP: 'تولید IP',
+                    fetchIP: 'دریافت IP',
+                    socks5Config: 'تنظیمات SOCKS5 (s):',
+                    customHomepage: 'URL صفحه اصلی سفارشی (homepage):',
+                    customHomepagePlaceholder: 'مثال: https://example.com',
+                    customHomepageHint: 'تنظیم URL سفارشی به عنوان استتار صفحه اصلی. هنگام دسترسی به مسیر اصلی / محتوای این URL نمایش داده می‌شود. اگر خالی بگذارید صفحه ترمینال پیش‌فرض نمایش داده می‌شود.',
+                    saveConfig: 'ذخیره تنظیمات',
+                    advancedControl: 'کنترل پیشرفته',
+                    subscriptionConverter: 'آدرس تبدیل اشتراک:',
+                    builtinPreferred: 'نوع ترجیحی داخلی:',
+                    enablePreferredDomain: 'فعال‌سازی دامنه ترجیحی',
+                    enablePreferredIP: 'فعال‌سازی IP ترجیحی',
+                    enableGitHubPreferred: 'فعال‌سازی ترجیح پیش‌فرض GitHub',
+                    allowAPIManagement: 'اجازه مدیریت API (ae):',
+                    regionMatching: 'تطبیق منطقه (rm):',
+                    downgradeControl: 'کنترل کاهش سطح (qj):',
+                    tlsControl: 'کنترل TLS (dkby):',
+                    preferredControl: 'کنترل ترجیحی (yxby):',
+                    saveAdvanced: 'ذخیره تنظیمات پیشرفته',
+                    loading: 'در حال بارگذاری...',
+                    currentConfig: '📍 پیکربندی مسیر فعلی',
+                    refreshConfig: 'تازه‌سازی تنظیمات',
+                    resetConfig: 'بازنشانی تنظیمات',
+                    subscriptionCopied: 'لینک اشتراک کپی شد',
+                    autoSubscriptionCopied: 'لینک اشتراک تشخیص خودکار کپی شد، کلاینت هنگام دسترسی بر اساس User-Agent به طور خودکار تشخیص داده و قالب مربوطه را برمی‌گرداند',
+                    trojanPasswordPlaceholder: 'خالی بگذارید تا از UUID استفاده شود',
+                    trojanPasswordHint: 'رمز عبور Trojan سفارشی را تنظیم کنید. اگر خالی بگذارید از UUID استفاده می‌شود. کلاینت به طور خودکار رمز عبور را با SHA224 هش می‌کند.',
+                    protocolHint: 'می‌توانید چندین پروتکل را همزمان فعال کنید. اشتراک گره‌های پروتکل‌های انتخاب شده را تولید می‌کند.<br>• VLESS WS: پروتکل استاندارد مبتنی بر WebSocket<br>• Trojan: احراز هویت با رمز عبور SHA224<br>• xhttp: پروتکل استتار مبتنی بر HTTP POST (نیاز به اتصال دامنه سفارشی و فعال‌سازی gRPC دارد)<br>• SOCKS5: پروتکل پراکسی SOCKS5 مبتنی بر WebSocket',
+                    saveProtocol: 'ذخیره تنظیمات پروتکل',
+                    subscriptionConverterPlaceholder: 'پیش‌فرض: https://url.v1.mk/sub',
+                    subscriptionConverterHint: 'آدرس API تبدیل اشتراک سفارشی، اگر خالی بگذارید از آدرس پیش‌فرض استفاده می‌شود',
+                    builtinPreferredHint: 'کنترل اینکه کدام گره‌های ترجیحی داخلی در اشتراک گنجانده شوند. به طور پیش‌فرض همه فعال هستند.',
+                    apiEnabledDefault: 'پیش‌فرض (بستن API)',
+                    apiEnabledYes: 'فعال‌سازی مدیریت API',
+                    apiEnabledHint: '⚠️ هشدار امنیتی: فعال‌سازی این گزینه اجازه می‌دهد IP های ترجیحی از طریق API به طور پویا اضافه شوند. توصیه می‌شود فقط در صورت نیاز فعال کنید.',
+                    regionMatchingDefault: 'پیش‌فرض (فعال‌سازی تطبیق منطقه)',
+                    regionMatchingNo: 'بستن تطبیق منطقه',
+                    regionMatchingHint: 'وقتی "بستن" تنظیم شود، تطبیق هوشمند منطقه انجام نمی‌شود',
+                    downgradeControlDefault: 'پیش‌فرض (عدم فعال‌سازی کاهش سطح)',
+                    downgradeControlNo: 'فعال‌سازی حالت کاهش سطح',
+                    downgradeControlHint: 'وقتی "فعال" تنظیم شود: اتصال مستقیم CF ناموفق → اتصال SOCKS5 → آدرس fallback',
+                    tlsControlDefault: 'پیش‌فرض (حفظ همه گره‌ها)',
+                    tlsControlYes: 'فقط گره‌های TLS',
+                    tlsControlHint: 'وقتی "فقط گره‌های TLS" تنظیم شود، فقط گره‌های با TLS تولید می‌شوند، گره‌های غیر TLS (مانند پورت 80) تولید نمی‌شوند',
+                    preferredControlDefault: 'پیش‌فرض (فعال‌سازی ترجیح)',
+                    preferredControlYes: 'بستن ترجیح',
+                    preferredControlHint: 'وقتی "بستن ترجیح" تنظیم شود، گره‌های IP و دامنه ترجیحی تولید نمی‌شوند',
+                    regionNames: {
+                        US: '🇺🇸 آمریکا', SG: '🇸🇬 سنگاپور', JP: '🇯🇵 ژاپن',
+                        KR: '🇰🇷 کره جنوبی', DE: '🇩🇪 آلمان', SE: '🇸🇪 سوئد', NL: '🇳🇱 هلند',
+                        FI: '🇫🇮 فنلاند', GB: '🇬🇧 بریتانیا'
+                    },
+                    terminal: 'ترمینال v8.9.1',
+                    githubProject: 'پروژه GitHub',
+                    autoDetectClient: 'تشخیص خودکار',
+                selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
+                customIPDisabledHint: 'هنگام استفاده از ProxyIP سفارشی، انتخاب منطقه غیرفعال است',
+                customIPMode: 'حالت ProxyIP سفارشی (متغیر p فعال است)',
+                customIPModeDesc: 'حالت IP سفارشی (تطبیق منطقه غیرفعال است)',
+                usingCustomProxyIP: 'استفاده از ProxyIP سفارشی: ',
+                customIPConfig: ' (پیکربندی متغیر p)',
+                customIPModeDisabled: 'حالت IP سفارشی، انتخاب منطقه غیرفعال است',
+                manualRegion: 'تعیین منطقه دستی',
+                manualRegionDesc: ' (تعیین دستی)',
+                proxyIPAvailable: '10/10 در دسترس (دامنه پیش‌فرض ProxyIP در دسترس است)',
+                smartSelection: 'انتخاب هوشمند نزدیک در حال انجام است',
+                sameRegionIP: 'IP هم‌منطقه در دسترس است (1)',
+                cloudflareDetection: 'تشخیص داخلی Cloudflare',
+                detectionFailed: 'تشخیص ناموفق',
+                apiTestResult: 'نتیجه تشخیص API: ',
+                apiTestTime: 'زمان تشخیص: ',
+                apiTestFailed: 'تشخیص API ناموفق: ',
+                unknownError: 'خطای ناشناخته',
+                apiTestError: 'تست API ناموفق: ',
+                kvNotConfigured: 'ذخیره‌سازی KV پیکربندی نشده است، نمی‌توانید از عملکرد مدیریت تنظیمات استفاده کنید.\\n\\nلطفا در Cloudflare Workers:\\n1. فضای نام KV ایجاد کنید\\n2. متغیر محیطی C را پیوند دهید\\n3. کد را دوباره مستقر کنید',
+                kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
+                kvCheckFailed: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
+                kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
+                kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+            }
+        };
+            
+            const t = translations[isFarsi ? 'fa' : 'zh'];
+        
+        const pageHtml = `<!DOCTYPE html>
         <html lang="${langAttr}" dir="${isFarsi ? 'rtl' : 'ltr'}">
     <head>
         <meta charset="UTF-8">
@@ -2767,6 +3087,12 @@
                                     <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
                                         <input type="checkbox" id="et" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
                                             <span style="font-size: 1.1rem;">${t.enableTrojan}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #00ff00;">
+                                        <input type="checkbox" id="ex" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${t.enableXhttp}</span>
                                     </label>
                                 </div>
                                 <div style="margin-bottom: 10px;">
@@ -3170,12 +3496,14 @@
                 // Read current checkbox states and add as URL parameters
                 var evChecked = document.getElementById('ev') && document.getElementById('ev').checked;
                 var etChecked = document.getElementById('et') && document.getElementById('et').checked;
+                var exChecked = document.getElementById('ex') && document.getElementById('ex').checked;
                 var esChecked = document.getElementById('es') && document.getElementById('es').checked;
                 
                 // Build protocol parameters
                 var protocolParams = [];
                 protocolParams.push('ev=' + (evChecked ? 'yes' : 'no'));
                 protocolParams.push('et=' + (etChecked ? 'yes' : 'no'));
+                protocolParams.push('ex=' + (exChecked ? 'yes' : 'no'));
                 protocolParams.push('es=' + (esChecked ? 'yes' : 'no'));
                 
                 // Add protocol params to subscription URL
@@ -3769,7 +4097,7 @@
                     document.getElementById('wkRegion').value = config.wk || '';
                     document.getElementById('ev').checked = config.ev !== 'no';
                     document.getElementById('et').checked = config.et === 'yes';
-                    
+                    document.getElementById('ex').checked = config.ex === 'yes';
                     document.getElementById('es').checked = config.es === 'yes';
                     document.getElementById('ech').checked = config.ech === 'yes';
                     document.getElementById('tp').value = config.tp || '';
@@ -4063,7 +4391,7 @@
                         const configData = { 
                             ev: document.getElementById('ev').checked ? 'yes' : 'no', 
                             et: document.getElementById('et').checked ? 'yes' : 'no', 
-                            
+                            ex: document.getElementById('ex').checked ? 'yes' : 'no',
                             es: document.getElementById('es').checked ? 'yes' : 'no',
                             ech: document.getElementById('ech').checked ? 'yes' : 'no',
                             tp: document.getElementById('tp').value,
@@ -4073,7 +4401,7 @@
                         
                         if (!document.getElementById('ev').checked && 
                             !document.getElementById('et').checked && 
-                            
+                            !document.getElementById('ex').checked &&
                             !document.getElementById('es').checked) {
                             alert('至少需要启用一个协议！');
                             return;
@@ -4087,7 +4415,7 @@
                 if (otherConfigForm) {
                     otherConfigForm.addEventListener('submit', async function(e) {
                         e.preventDefault();
-                        const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no',  ech: document.getElementById('ech').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
+                        const configData = { ev: document.getElementById('ev').checked ? 'yes' : 'no', et: document.getElementById('et').checked ? 'yes' : 'no', ex: document.getElementById('ex').checked ? 'yes' : 'no', ech: document.getElementById('ech').checked ? 'yes' : 'no', tp: document.getElementById('tp').value,
                             d: document.getElementById('customPath').value,
                             p: document.getElementById('customIP').value,
                             yx: document.getElementById('yx').value,
@@ -4100,7 +4428,8 @@
                         
                         // 确保至少选择一个协议
                         if (!document.getElementById('ev').checked && 
-                            !document.getElementById('et').checked ) {
+                            !document.getElementById('et').checked && 
+                            !document.getElementById('ex').checked) {
                             alert('至少需要启用一个协议！');
                             return;
                         }
@@ -5043,11 +5372,577 @@
     }
 
     let ACTIVE_CONNECTIONS = 0;
+    const XHTTP_BUFFER_SIZE = 128 * 1024;
     const CONNECT_TIMEOUT_MS = 5000;
     const IDLE_TIMEOUT_MS = 45000;
     const MAX_RETRIES = 2;
     const MAX_CONCURRENT = 32;
 
+    function xhttp_sleep(ms) {
+        return new Promise((r) => setTimeout(r, ms));
+    }
+
+    function validate_uuid_xhttp(id, uuid) {
+        for (let index = 0; index < 16; index++) {
+            if (id[index] !== uuid[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    class XhttpCounter {
+        #total
+
+        constructor() {
+            this.#total = 0;
+        }
+
+        get() {
+            return this.#total;
+        }
+
+        add(size) {
+            this.#total += size;
+        }
+    }
+
+    function concat_typed_arrays(first, ...args) {
+        let len = first.length;
+        for (let a of args) {
+            len += a.length;
+        }
+        const r = new first.constructor(len);
+        r.set(first, 0);
+        len = first.length;
+        for (let a of args) {
+            r.set(a, len);
+            len += a.length;
+        }
+        return r;
+    }
+
+    function parse_uuid_xhttp(uuid) {
+        uuid = uuid.replaceAll('-', '');
+        const r = [];
+        for (let index = 0; index < 16; index++) {
+            const v = parseInt(uuid.substr(index * 2, 2), 16);
+            r.push(v);
+        }
+        return r;
+    }
+
+    function get_xhttp_buffer(size) {
+        return new Uint8Array(new ArrayBuffer(size || XHTTP_BUFFER_SIZE));
+    }
+
+    async function read_xhttp_header(readable, uuid_str) {
+        const reader = readable.getReader({ mode: 'byob' });
+
+        try {
+            let r = await reader.readAtLeast(1 + 16 + 1, get_xhttp_buffer());
+            let rlen = 0;
+            let idx = 0;
+            let cache = r.value;
+            rlen += r.value.length;
+
+            const version = cache[0];
+            const id = cache.slice(1, 1 + 16);
+            const uuid = parse_uuid_xhttp(uuid_str);
+            if (!validate_uuid_xhttp(id, uuid)) {
+                return `invalid UUID`;
+            }
+            const pb_len = cache[1 + 16];
+            const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1;
+
+            if (addr_plus1 + 1 > rlen) {
+                if (r.done) {
+                    return `header too short`;
+                }
+                idx = addr_plus1 + 1 - rlen;
+                r = await reader.readAtLeast(idx, get_xhttp_buffer());
+                rlen += r.value.length;
+                cache = concat_typed_arrays(cache, r.value);
+            }
+
+            const cmd = cache[1 + 16 + 1 + pb_len];
+            if (cmd !== 1) {
+                return `unsupported command: ${cmd}`;
+            }
+            const port = (cache[addr_plus1 - 1 - 2] << 8) + cache[addr_plus1 - 1 - 1];
+            const atype = cache[addr_plus1 - 1];
+            let header_len = -1;
+            if (atype === ADDRESS_TYPE_IPV4) {
+                header_len = addr_plus1 + 4;
+            } else if (atype === ADDRESS_TYPE_IPV6) {
+                header_len = addr_plus1 + 16;
+            } else if (atype === ADDRESS_TYPE_URL) {
+                header_len = addr_plus1 + 1 + cache[addr_plus1];
+            }
+
+            if (header_len < 0) {
+                return 'read address type failed';
+            }
+
+            idx = header_len - rlen;
+            if (idx > 0) {
+                if (r.done) {
+                    return `read address failed`;
+                }
+                r = await reader.readAtLeast(idx, get_xhttp_buffer());
+                rlen += r.value.length;
+                cache = concat_typed_arrays(cache, r.value);
+            }
+
+            let hostname = '';
+            idx = addr_plus1;
+            switch (atype) {
+                case ADDRESS_TYPE_IPV4:
+                    hostname = cache.slice(idx, idx + 4).join('.');
+                    break;
+                case ADDRESS_TYPE_URL:
+                    hostname = new TextDecoder().decode(
+                        cache.slice(idx + 1, idx + 1 + cache[idx]),
+                    );
+                    break;
+                case ADDRESS_TYPE_IPV6:
+                    hostname = cache
+                        .slice(idx, idx + 16)
+                        .reduce(
+                            (s, b2, i2, a) =>
+                                i2 % 2
+                                    ? s.concat(((a[i2 - 1] << 8) + b2).toString(16))
+                                    : s,
+                            [],
+                        )
+                        .join(':');
+                    break;
+            }
+
+            if (hostname.length < 1) {
+                return 'failed to parse hostname';
+            }
+
+            const data = cache.slice(header_len);
+            return {
+                hostname,
+                port,
+                data,
+                resp: new Uint8Array([version, 0]),
+                reader,
+                done: r.done,
+            };
+        } catch (error) {
+            try { reader.releaseLock(); } catch (_) {}
+            throw error;
+        }
+    }
+
+    async function upload_to_remote_xhttp(counter, writer, httpx) {
+        async function inner_upload(d) {
+            if (!d || d.length === 0) {
+                return;
+            }
+            counter.add(d.length);
+            try {
+                await writer.write(d);
+            } catch (error) {
+                throw error;
+            }
+        }
+
+        try {
+            await inner_upload(httpx.data);
+            let chunkCount = 0;
+            while (!httpx.done) {
+                const r = await httpx.reader.read(get_xhttp_buffer());
+                if (r.done) break;
+                await inner_upload(r.value);
+                httpx.done = r.done;
+                chunkCount++;
+                if (chunkCount % 10 === 0) {
+                    await xhttp_sleep(0);
+                }
+                if (!r.value || r.value.length === 0) {
+                    await xhttp_sleep(2);
+                }
+            }
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    function create_xhttp_uploader(httpx, writable) {
+        const counter = new XhttpCounter();
+        const writer = writable.getWriter();
+        
+        const done = (async () => {
+            try {
+                await upload_to_remote_xhttp(counter, writer, httpx);
+            } catch (error) {
+                throw error;
+            } finally {
+                try {
+                    await writer.close();
+                } catch (error) {
+                    
+                }
+            }
+        })();
+
+        return {
+            counter,
+            done,
+            abort: () => {
+                try { writer.abort(); } catch (_) {}
+            }
+        };
+    }
+
+    function create_xhttp_downloader(resp, remote_readable) {
+        const counter = new XhttpCounter();
+        let stream;
+
+        const done = new Promise((resolve, reject) => {
+            stream = new TransformStream(
+                {
+                    start(controller) {
+                        counter.add(resp.length);
+                        controller.enqueue(resp);
+                    },
+                    transform(chunk, controller) {
+                        counter.add(chunk.length);
+                        controller.enqueue(chunk);
+                    },
+                    cancel(reason) {
+                        reject(`download cancelled: ${reason}`);
+                    },
+                },
+                null,
+                new ByteLengthQueuingStrategy({ highWaterMark: XHTTP_BUFFER_SIZE }),
+            );
+
+            let lastActivity = Date.now();
+            const idleTimer = setInterval(() => {
+                if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+                    try {
+                        stream.writable.abort?.('idle timeout');
+                    } catch (_) {}
+                    clearInterval(idleTimer);
+                    reject('idle timeout');
+                }
+            }, 5000);
+
+            const reader = remote_readable.getReader();
+            const writer = stream.writable.getWriter();
+
+            ;(async () => {
+                try {
+                    let chunkCount = 0;
+                    while (true) {
+                        const r = await reader.read();
+                        if (r.done) {
+                            break;
+                        }
+                        lastActivity = Date.now();
+                        await writer.write(r.value);
+                        chunkCount++;
+                        if (chunkCount % 5 === 0) {
+                            await xhttp_sleep(0);
+                        }
+                    }
+                    await writer.close();
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                } finally {
+                    try { 
+                        reader.releaseLock(); 
+                    } catch (_) {}
+                    try { 
+                        writer.releaseLock(); 
+                    } catch (_) {}
+                    clearInterval(idleTimer);
+                }
+            })();
+        });
+
+        return {
+            readable: stream.readable,
+            counter,
+            done,
+            abort: () => {
+                try { stream.readable.cancel(); } catch (_) {}
+                try { stream.writable.abort(); } catch (_) {}
+            }
+        };
+    }
+
+    async function connect_to_remote_xhttp(httpx, ...remotes) {
+        let attempt = 0;
+        let lastErr;
+        
+        const connectionList = [httpx.hostname, ...remotes.filter(r => r && r !== httpx.hostname)];
+        
+        for (const hostname of connectionList) {
+            if (!hostname) continue;
+            
+            attempt = 0;
+            while (attempt < MAX_RETRIES) {
+                attempt++;
+                try {
+                    const remote = connect({ hostname, port: httpx.port });
+                    const timeoutPromise = xhttp_sleep(CONNECT_TIMEOUT_MS).then(() => {
+                        throw new Error(atob('Y29ubmVjdCB0aW1lb3V0'));
+                    });
+                    
+                    await Promise.race([remote.opened, timeoutPromise]);
+
+                    const uploader = create_xhttp_uploader(httpx, remote.writable);
+                    const downloader = create_xhttp_downloader(httpx.resp, remote.readable);
+                    
+                    return { 
+                        downloader, 
+                        uploader,
+                        close: () => {
+                            try { remote.close(); } catch (_) {}
+                        }
+                    };
+                } catch (err) {
+                    lastErr = err;
+                    if (attempt < MAX_RETRIES) {
+                        await xhttp_sleep(500 * attempt);
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    async function handle_xhttp_client(body, uuid) {
+        if (ACTIVE_CONNECTIONS >= MAX_CONCURRENT) {
+            return new Response('Too many connections', { status: 429 });
+        }
+        
+        ACTIVE_CONNECTIONS++;
+        
+        let cleaned = false;
+        const cleanup = () => {
+            if (!cleaned) {
+                ACTIVE_CONNECTIONS = Math.max(0, ACTIVE_CONNECTIONS - 1);
+                cleaned = true;
+            }
+        };
+
+        try {
+            const httpx = await read_xhttp_header(body, uuid);
+            if (typeof httpx !== 'object' || !httpx) {
+                return null;
+            }
+
+            const remoteConnection = await connect_to_remote_xhttp(httpx, fallbackAddress, '13.230.34.30');
+            if (remoteConnection === null) {
+                return null;
+            }
+
+            const connectionClosed = Promise.race([
+                (async () => {
+                    try {
+                        await remoteConnection.downloader.done;
+                    } catch (err) {
+                        
+                    }
+                })(),
+                (async () => {
+                    try {
+                        await remoteConnection.uploader.done;
+                    } catch (err) {
+                        
+                    }
+                })(),
+                xhttp_sleep(IDLE_TIMEOUT_MS).then(() => {
+                    
+                })
+            ]).finally(() => {
+                try { remoteConnection.close(); } catch (_) {}
+                try { remoteConnection.downloader.abort(); } catch (_) {}
+                try { remoteConnection.uploader.abort(); } catch (_) {}
+                
+                cleanup();
+            });
+
+            return {
+                readable: remoteConnection.downloader.readable,
+                closed: connectionClosed
+            };
+        } catch (error) {
+            cleanup();
+            return null;
+        }
+    }
+
+    async function handleXhttpPost(request) {
+        try {
+            return await handle_xhttp_client(request.body, at);
+        } catch (err) {
+            return null;
+        }
+    }
+
+    function base64ToArray(b64Str) {
+        if (!b64Str) return { error: null };
+        try { b64Str = b64Str.replace(/-/g, '+').replace(/_/g, '/'); return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null }; } 
+        catch (error) { return { error }; }
+    }
+
+    function closeSocketQuietly(socket) { try { if (socket.readyState === 1 || socket.readyState === 2) socket.close(); } catch (error) {} }
+
+    const hexTable = Array.from({ length: 256 }, (v, i) => (i + 256).toString(16).slice(1));
+    function formatIdentifier(arr, offset = 0) {
+        const id = (hexTable[arr[offset]]+hexTable[arr[offset+1]]+hexTable[arr[offset+2]]+hexTable[arr[offset+3]]+"-"+hexTable[arr[offset+4]]+hexTable[arr[offset+5]]+"-"+hexTable[arr[offset+6]]+hexTable[arr[offset+7]]+"-"+hexTable[arr[offset+8]]+hexTable[arr[offset+9]]+"-"+hexTable[arr[offset+10]]+hexTable[arr[offset+11]]+hexTable[arr[offset+12]]+hexTable[arr[offset+13]]+hexTable[arr[offset+14]]+hexTable[arr[offset+15]]).toLowerCase();
+        if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
+        return id;
+    }
+
+    async function fetchAndParseNewIPs() {
+        const url = piu || "https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt";
+        try {
+            const urls = url.includes(',') ? url.split(',').map(u => u.trim()).filter(u => u) : [url];
+            const apiResults = await fetchPreferredAPI(urls, '443', 5000);
+            
+            if (apiResults.length > 0) {
+                const results = [];
+                const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+                
+                for (const item of apiResults) {
+                    const match = item.match(regex);
+                    if (match) {
+                        results.push({
+                            ip: match[1],
+                            port: parseInt(match[2] || '443', 10),
+                            name: match[3]?.trim() || match[1]
+                        });
+                    }
+                }
+                return results;
+            }
+            
+            const response = await fetch(url);
+            if (!response.ok) return [];
+            const text = await response.text();
+            const results = [];
+            const lines = text.trim().replace(/\r/g, "").split('\n');
+            const simpleRegex = /^([^:]+):(\d+)#(.*)$/;
+
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (!trimmedLine) continue;
+                const match = trimmedLine.match(simpleRegex);
+                if (match) {
+                    results.push({
+                        ip: match[1],
+                        port: parseInt(match[2], 10),
+                        name: match[3].trim() || match[1]
+                    });
+                }
+            }
+            return results;
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function generateLinksFromNewIPs(list, user, workerDomain, echConfig = null) {
+        
+        const CF_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+        const CF_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+        
+        const links = [];
+        const wsPath = '/?ed=2048';
+        const proto = atob('dmxlc3M=');
+        
+        list.forEach(item => {
+            const nodeName = item.name.replace(/\s/g, '_');
+            const port = item.port;
+            
+            if (CF_HTTPS_PORTS.includes(port)) {
+                
+                const wsNodeName = `${nodeName}`;
+                let link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
+                
+                // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+                if (enableECH) {
+                    const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+                    const echDomain = customECHDomain || 'cloudflare-ech.com';
+                    link += `&alpn=h3%2Ch2%2Chttp%2F1.1&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                }
+                
+                link += `#${encodeURIComponent(wsNodeName)}`;
+                links.push(link);
+            } else if (CF_HTTP_PORTS.includes(port)) {
+                
+                if (!disableNonTLS) {
+                    const wsNodeName = `${nodeName}`;
+                    const link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=none&type=ws&host=${workerDomain}&path=${wsPath}#${encodeURIComponent(wsNodeName)}`;
+                    links.push(link);
+                }
+            } else {
+                
+                const wsNodeName = `${nodeName}`;
+                let link = `${proto}://${user}@${item.ip}:${port}?encryption=none&security=tls&sni=${workerDomain}&fp=${enableECH ? 'chrome' : 'randomized'}&type=ws&host=${workerDomain}&path=${wsPath}`;
+                
+                // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+                if (enableECH) {
+                    const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+                    const echDomain = customECHDomain || 'cloudflare-ech.com';
+                    link += `&alpn=h3%2Ch2%2Chttp%2F1.1&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+                }
+                
+                link += `#${encodeURIComponent(wsNodeName)}`;
+                links.push(link);
+            }
+        });
+        return links;
+    }
+
+    function generateXhttpLinksFromSource(list, user, workerDomain, echConfig = null) {
+        const links = [];
+        const nodePath = user.substring(0, 8);
+        
+        list.forEach(item => {
+            let nodeNameBase = item.isp.replace(/\s/g, '_');
+            if (item.colo && item.colo.trim()) {
+                nodeNameBase = `${nodeNameBase}-${item.colo.trim()}`;
+            }
+            const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
+            const port = item.port || 443;
+            
+            const wsNodeName = `${nodeNameBase}`;
+            const params = new URLSearchParams({
+                encryption: 'none',
+                security: 'tls',
+                sni: workerDomain,
+                fp: 'chrome',
+                type: 'xhttp',
+                host: workerDomain,
+                path: `/${nodePath}`,
+                mode: 'stream-one'
+            });
+            
+            // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+            if (enableECH) {
+                const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+                const echDomain = customECHDomain || 'cloudflare-ech.com';
+                params.set('alpn', 'h3,h2,http/1.1');
+                params.set('ech', `${echDomain}+${dnsServer}`);
+            }
+            
+            links.push(`vless://${user}@${safeIP}:${port}?${params.toString()}#${encodeURIComponent(wsNodeName)}`);
+        });
+        
+        return links;
+    }
 
     async function generateTrojanLinksFromNewIPs(list, user, workerDomain, echConfig = null) {
         
@@ -5466,6 +6361,10 @@
         
         tp = getConfigValue('tp', '') || '';
         
+        const xhttpControl = getConfigValue('ex', '');
+        if (xhttpControl !== undefined && xhttpControl !== '') {
+            ex = xhttpControl === 'yes' || xhttpControl === true || xhttpControl === 'true';
+        }
         
         if (!ev && !et && !ex) {
             ev = true;
